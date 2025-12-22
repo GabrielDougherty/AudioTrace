@@ -112,18 +112,22 @@ bool AudioTapManager::start() {
     );
     
     if (status != noErr) {
+        NSLog(@"❌ Failed to create IOProcID: %d", status);
         stop();
         return false;
     }
+    NSLog(@"✅ Created IOProcID for aggregate device %u", aggregate_device_id_);
 
     // Start the aggregate device
     status = AudioDeviceStart(aggregate_device_id_, io_proc_id_);
     if (status != noErr) {
+        NSLog(@"❌ Failed to start aggregate device: %d", status);
         AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
         io_proc_id_ = nullptr;
         stop();
         return false;
     }
+    NSLog(@"✅ Started aggregate device %u", aggregate_device_id_);
 
     is_running_ = true;
     return true;
@@ -160,11 +164,7 @@ void AudioTapManager::set_audio_callback(AudioCallback callback) {
     audio_callback_ = std::move(callback);
 }
 
-s
-
-std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
-    return tracker_.snapshot();
-}td::vector<pid_t> AudioTapManager::get_tapped_processes() const {
+std::vector<pid_t> AudioTapManager::get_tapped_processes() const {
     std::vector<pid_t> result;
     result.reserve(process_taps_.size());
     
@@ -173,7 +173,42 @@ std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
     }
     
     return result;
-}// Analyze audio for activity
+}
+
+std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
+    return tracker_.snapshot();
+}
+
+void AudioTapManager::worker_thread_proc() {
+    NSLog(@"🧵 Worker thread started, taps=%zu", process_taps_.size());
+    int loop_count = 0;
+    int total_pops = 0;
+    int samples_checked = 0;
+    
+    while (!worker_should_stop_.load(std::memory_order_acquire)) {
+        bool did_work = false;
+        int pops_this_loop = 0;
+
+        for (auto& tap : process_taps_) {
+            AudioTapData data;
+            while (tap->ring_buffer.pop(data)) {
+                pops_this_loop++;
+                total_pops++;
+                samples_checked++;
+                
+                // Calculate RMS manually for debugging
+                float sum = 0.0f;
+                for (uint32_t i = 0; i < data.frame_count * data.channel_count; ++i) {
+                    sum += data.samples[i] * data.samples[i];
+                }
+                float rms = std::sqrt(sum / (data.frame_count * data.channel_count));
+                
+                if (samples_checked % 1000 == 0) {
+                    NSLog(@"🔍 Sample %d: PID %d, RMS=%.9f (threshold=0.005)", 
+                          samples_checked, data.pid, rms);
+                }
+                
+                // Analyze audio for activity
                 auto event = analyzer_.analyze(
                     data.samples.data(),
                     data.frame_count,
@@ -186,6 +221,8 @@ std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
                     // Record activity
                     tracker_.record_activity(*event);
                     
+                    NSLog(@"🎵 Activity! PID %d, RMS: %.6f", data.pid, event->rms_level);
+                    
                     // Also call user callback if set
                     if (audio_callback_) {
                         audio_callback_(data);
@@ -195,6 +232,12 @@ std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
                 did_work = true;
             }
         }
+        
+        if (pops_this_loop > 0 && loop_count % 50 == 0) {
+            NSLog(@"📦 Loop %d: popped %d buffers (total=%d)", loop_count, pops_this_loop, total_pops);
+        }
+        
+        loop_count++;
 
         if (!did_work) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -205,15 +248,6 @@ std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
                 tracker_.cleanup_expired();
                 cleanup_counter = 0;
             }
-                if (audio_callback_) {
-                    audio_callback_(data);
-                }
-                did_work = true;
-            }
-        }
-
-        if (!did_work) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }
@@ -233,6 +267,12 @@ OSStatus AudioTapManager::audio_io_proc(
         return noErr;
     }
 
+    static int callback_count = 0;
+    if (++callback_count % 1000 == 0) {
+        NSLog(@"🎤 Audio callback fired %d times, %u buffers", 
+              callback_count, inInputData->mNumberBuffers);
+    }
+
     manager->process_input_data(inInputData, inInputTime);
     
     return noErr;
@@ -245,7 +285,14 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         return;
     }
     
-    for (uint32_t i = 0; i < buffer_list->mNumberBuffers; ++i) {
+    // Each buffer in the aggregate device corresponds to one tap
+    // Buffer index i should match tap index i
+    const uint32_t num_buffers = std::min(
+        static_cast<uint32_t>(buffer_list->mNumberBuffers),
+        static_cast<uint32_t>(process_taps_.size())
+    );
+    
+    for (uint32_t i = 0; i < num_buffers; ++i) {
         const AudioBuffer& buffer = buffer_list->mBuffers[i];
         
         if (buffer.mData == nullptr || buffer.mDataByteSize == 0) {
@@ -257,19 +304,19 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         const uint32_t channel_count = buffer.mNumberChannels;
         const uint32_t frame_count = sample_count / channel_count;
 
-        for (auto& tap : process_taps_) {
-            AudioTapData data;
-            data.pid = tap->pid;
-            data.frame_count = frame_count;
-            data.channel_count = channel_count;
-            data.sample_time = timestamp ? timestamp->mSampleTime : 0;
-            
-            const size_t copy_size = std::min(static_cast<size_t>(sample_count), tap->temp_buffer.size());
-            std::copy_n(samples, copy_size, tap->temp_buffer.begin());
-            data.samples = tap->temp_buffer;
-            
-            tap->ring_buffer.push(data);
-        }
+        // Send this buffer only to the corresponding tap
+        auto& tap = process_taps_[i];
+        AudioTapData data;
+        data.pid = tap->pid;
+        data.frame_count = frame_count;
+        data.channel_count = channel_count;
+        data.sample_time = timestamp ? timestamp->mSampleTime : 0;
+        
+        const size_t copy_size = std::min(static_cast<size_t>(sample_count), tap->temp_buffer.size());
+        std::copy_n(samples, copy_size, tap->temp_buffer.begin());
+        data.samples = tap->temp_buffer;
+        
+        tap->ring_buffer.push(data);
     }
 }
 
@@ -313,12 +360,24 @@ bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& ta
     CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceIsPrivateKey), is_private);
     CFRelease(is_private);
     
+    // Disable stacking (we want taps as separate streams)
+    int is_stacked_value = 0;
+    CFNumberRef is_stacked = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &is_stacked_value);
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceIsStackedKey), is_stacked);
+    CFRelease(is_stacked);
+    
+    // Enable auto-start for taps
+    int auto_start_value = 1;
+    CFNumberRef auto_start = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &auto_start_value);
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceTapAutoStartKey), auto_start);
+    CFRelease(auto_start);
+    
     // Add taps to aggregate device if we have any
     if (!tap_uids.empty()) {
         CFMutableArrayRef tap_list = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
         
         for (CFStringRef tap_uid : tap_uids) {
-            // Create sub-tap dictionary
+            // Create sub-tap dictionary with drift compensation enabled
             CFMutableDictionaryRef sub_tap = CFDictionaryCreateMutable(
                 kCFAllocatorDefault,
                 0,
@@ -327,6 +386,13 @@ bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& ta
             );
             
             CFDictionarySetValue(sub_tap, CFSTR(kAudioSubTapUIDKey), tap_uid);
+            
+            // Enable drift compensation
+            int drift_comp_value = 1;
+            CFNumberRef drift_comp = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &drift_comp_value);
+            CFDictionarySetValue(sub_tap, CFSTR(kAudioSubTapDriftCompensationKey), drift_comp);
+            CFRelease(drift_comp);
+            
             CFArrayAppendValue(tap_list, sub_tap);
             CFRelease(sub_tap);
         }
@@ -344,6 +410,8 @@ bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& ta
         NSLog(@"AudioHardwareCreateAggregateDevice failed with status %d", (int)status);
         return false;
     }
+    
+    NSLog(@"✅ Created aggregate device with %zu taps", tap_uids.size());
     
     return aggregate_device_id_ != kAudioObjectUnknown;
 }
@@ -489,10 +557,10 @@ pid_t AudioTapManager::get_pid_from_audio_object(AudioObjectID obj_id) {
 }
 
 bool AudioTapManager::create_tap_for_system() {
-    // For system-wide audio, we'll create a stereo mixdown tap
+    // For system-wide audio, create a stereo mixdown tap
     @autoreleasepool {
-        // Create a stereo mixdown tap with empty process list for system-wide audio
-        CATapDescription* tapDesc = [[CATapDescription alloc] initStereoGlobalTapWithProcesses:@[]];
+        // Create a stereo mixdown tap with empty process array for system-wide
+        CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:@[]];
         if (!tapDesc) {
             return false;
         }

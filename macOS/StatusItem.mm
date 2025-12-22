@@ -1,20 +1,21 @@
 #import "StatusItem.hpp"
 #import "ProcessInfo.hpp"
+#include "../AudioCore/AudioTapManager.hpp"
 #include <chrono>
 
 @interface StatusItem ()
 @property (strong, nonatomic) NSStatusItem* statusItem;
 @property (strong, nonatomic) NSMenu* menu;
 @property (strong, nonatomic) NSTimer* updateTimer;
-@property (assign, nonatomic) AudioTrace::ActivityTracker* activityTracker;
+@property (assign, nonatomic) AudioTrace::AudioTapManager* tapManager;
 @end
 
 @implementation StatusItem
 
-- (instancetype)initWithActivityTracker:(AudioTrace::ActivityTracker*)tracker {
+- (instancetype)initWithTapManager:(AudioTrace::AudioTapManager*)tapManager {
     self = [super init];
     if (self) {
-        _activityTracker = tracker;
+        _tapManager = tapManager;
         _menu = [[NSMenu alloc] init];
         _menu.autoenablesItems = NO;
     }
@@ -51,14 +52,17 @@
 }
 
 - (void)updateMenu {
-    if (!self.activityTracker) {
+    if (!self.tapManager) {
+        NSLog(@"⚠️ updateMenu: tapManager is NULL!");
         return;
     }
 
     [self.menu removeAllItems];
 
-    // Get activity snapshot from C++ tracker
-    auto snapshots = self.activityTracker->snapshot();
+    // Get activity snapshot from tap manager
+    auto snapshots = self.tapManager->get_activity_snapshot();
+    
+    NSLog(@"📊 updateMenu: Got %lu snapshots", (unsigned long)snapshots.size());
 
     if (snapshots.empty()) {
         NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:@"No recent audio activity"

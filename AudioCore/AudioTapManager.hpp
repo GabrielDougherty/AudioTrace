@@ -67,13 +67,12 @@ private:
     AudioCallback audio_callback_;
 
     // Core Audio tap and aggregate device
-    AudioObjectID aggregate_device_id_ = kAudioObjectUnknown;
-    AudioDeviceIOProcID io_proc_id_ = nullptr;
     
     // Ring buffers for each tapped process (realtime -> worker)
     struct ProcessTap {
         pid_t pid;
         AudioObjectID tap_id;
+        AudioDeviceIOProcID io_proc_id = nullptr;
         RingBuffer<AudioTapData> ring_buffer;
         std::vector<float> temp_buffer;  // Pre-allocated for realtime use
         
@@ -94,15 +93,15 @@ private:
 
     // Helper methods
     bool create_aggregate_device(const std::vector<CFStringRef>& tap_uids);
-    void destroy_aggregate_device();
+    void destroy_taps();
     bool create_tap_for_process(pid_t pid);
     bool create_tap_for_system();
     std::vector<AudioObjectID> discover_audio_processes();
     pid_t get_pid_from_audio_object(AudioObjectID obj_id);
     AudioStreamBasicDescription get_stream_format() const;
 
-    // Core Audio callback (REALTIME SAFE)
-    static OSStatus audio_io_proc(
+    // Core Audio callback (REALTIME SAFE) - one per tap
+    static OSStatus tap_io_proc(
         AudioDeviceID inDevice,
         const AudioTimeStamp* inNow,
         const AudioBufferList* inInputData,
@@ -110,10 +109,6 @@ private:
         AudioBufferList* outOutputData,
         const AudioTimeStamp* inOutputTime,
         void* inClientData
-    ) noexcept;
-
-    void process_input_data(const AudioBufferList* buffer_list, 
-                           const AudioTimeStamp* timestamp) noexcept;
-};
+    
 
 }  // namespace AudioTrace
