@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    
+    <key>CFBundleName</key>
+    <string>$(PRODUCT_NAME)</string>
+    
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    
+    <key>LSMinimumSystemVersion</key>
+    <string>14.4</string>
+    
+    <key>LSUIElement</key>
+    <true/>
+    
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    
+    <!-- Audio capture permission -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>AudioTrace monitors which applications are producing sound. We do not record or save any audio data.</string>
+    
+    <!-- System audio access may also require this -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>AudioTrace needs to detect running applications to show which ones are playing audio.</string>
+    
+    <!-- Application doesn't appear in Dock -->
+    <key>LSBackgroundOnly</key>
+    <false/>
+</dict>
+</plist>

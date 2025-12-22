@@ -1,0 +1,96 @@
+#pragma once
+
+#include "RingBuffer.hpp"
+#include <CoreAudio/CoreAudio.h>
+#include <AudioToolbox/AudioToolbox.h>
+#include <memory>
+#include <vector>
+#include <functional>
+#include <thread>
+#include <atomic>
+#include <sys/types.h>
+
+namespace AudioTrace {
+
+/// Raw audio data from a process tap
+struct AudioTapData {
+    pid_t pid;
+    std::vector<float> samples;  // Interleaved samples
+    uint32_t frame_count;
+    uint32_t channel_count;
+    uint64_t sample_time;
+};
+
+/// Manages Core Audio process taps for system audio capture
+/// Realtime-safe audio callbacks write to lock-free ring buffers
+class AudioTapManager {
+public:
+    using AudioCallback = std::function<void(const AudioTapData&)>;
+
+    struct Config {
+        uint32_t sample_rate = 48000;
+        uint32_t buffer_frames = 512;
+        size_t ringbuffer_capacity = 64;  // Number of buffers to queue
+    };
+
+    explicit AudioTapManager(Config config);
+    ~AudioTapManager();
+
+    AudioTapManager(const AudioTapManager&) = delete;
+    AudioTapManager& operator=(const AudioTapManager&) = delete;
+
+    /// Start capturing system audio
+    /// TODO: Implement Core Audio tap setup
+    bool start();
+
+    /// Stop capturing
+    void stop();
+
+    /// Set callback for audio data (called from worker thread, not realtime)
+    void set_audio_callback(AudioCallback callback);
+
+    /// Get list of currently tapped process IDs
+    std::vector<pid_t> get_tapped_processes() const;
+
+private:
+    Config config_;
+    bool is_running_ = false;
+    AudioCallback audio_callback_;
+
+    // TODO: Core Audio tap objects
+    // std::vector<AudioDeviceTap> taps_;
+    
+    // Ring buffers for each tapped process (realtime -> worker)
+    struct ProcessTap {
+        pid_t pid;
+        RingBuffer<AudioTapData> ring_buffer;
+        // TODO: Core Audio tap handle
+        
+        ProcessTap(pid_t p, size_t capacity)
+            : pid(p), ring_buffer(capacity)
+        {}
+    };
+    
+    std::vector<std::unique_ptr<ProcessTap>> process_taps_;
+
+    // Worker thread that drains ring buffers
+    void worker_thread_proc();
+    std::unique_ptr<std::thread> worker_thread_;
+    std::atomic<bool> worker_should_stop_{false};
+
+    // Core Audio callback (REALTIME SAFE)
+    // TODO: Implement actual Core Audio IOProc
+    static OSStatus audio_io_proc(
+        AudioDeviceID inDevice,
+        const AudioTimeStamp* inNow,
+        const AudioBufferList* inInputData,
+        const AudioTimeStamp* inInputTime,
+        AudioBufferList* outOutputData,
+        const AudioTimeStamp* inOutputTime,
+        void* inClientData
+    ) noexcept;
+
+    void process_audio_buffers() noexcept;
+};
+
+}  // namespace AudioTrace

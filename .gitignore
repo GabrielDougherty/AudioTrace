@@ -1,0 +1,23 @@
+build/
+*.app
+.DS_Store
+*.dSYM
+*.o
+*.a
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Xcode
+*.xcodeproj
+*.xcworkspace
+xcuserdata/
+DerivedData/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
