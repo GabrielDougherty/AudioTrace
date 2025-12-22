@@ -2,6 +2,8 @@
 #include <thread>
 #include <algorithm>
 #include <CoreFoundation/CoreFoundation.h>
+#import <CoreAudio/CATapDescription.h>
+#import <CoreAudio/AudioHardwareTapping.h>
 
 namespace AudioTrace {
 
@@ -223,52 +225,46 @@ void AudioTapManager::destroy_aggregate_device() {
 }
 
 bool AudioTapManager::create_tap_for_process(pid_t pid) {
-    CATapDescription tap_desc{};
-    tap_desc.mProcesses = CFArrayCreate(
-        kCFAllocatorDefault,
-        nullptr,
-        0,
-        &kCFTypeArrayCallBacks
-    );
-    
-    if (!tap_desc.mProcesses) {
-        return false;
+    @autoreleasepool {
+        // Create array of process AudioObjectIDs
+        NSNumber* processID = @(pid);
+        NSArray<NSNumber*>* processes = @[processID];
+        
+        // Create tap description (stereo mixdown of this process)
+        CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
+        if (!tapDesc) {
+            return false;
+        }
+        
+        // Set mute behavior (don't mute original audio)
+        tapDesc.muteBehavior = CATapUnmuted;
+        
+        // Create the tap
+        AudioObjectID tap_id = kAudioObjectUnknown;
+        OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
+        
+        if (status != noErr || tap_id == kAudioObjectUnknown) {
+            return false;
+        }
+
+        // Add tap to aggregate device
+        if (!add_tap_to_aggregate(tap_id)) {
+            AudioHardwareDestroyProcessTap(tap_id);
+            return false;
+        }
+
+        // Create ProcessTap structure
+        size_t buffer_size = config_.buffer_frames * 2;
+        auto process_tap = std::make_unique<ProcessTap>(
+            pid,
+            tap_id,
+            config_.ringbuffer_capacity,
+            buffer_size
+        );
+        
+        process_taps_.push_back(std::move(process_tap));
+        return true;
     }
-
-    CFNumberRef pid_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pid);
-    if (pid_num) {
-        CFArrayAppendValue((CFMutableArrayRef)tap_desc.mProcesses, pid_num);
-        CFRelease(pid_num);
-    }
-
-    tap_desc.mMixdown = kCATapMixdownStereo;
-    tap_desc.mMuteBehavior = kCATapMuteBehaviorUnmuted;
-    tap_desc.mPrivacy = kCATapPrivacyPrivate;
-
-    AudioObjectID tap_id = kAudioObjectUnknown;
-    OSStatus status = AudioHardwareCreateProcessTap(&tap_desc, &tap_id);
-    
-    CFRelease(tap_desc.mProcesses);
-    
-    if (status != noErr || tap_id == kAudioObjectUnknown) {
-        return false;
-    }
-
-    if (!add_tap_to_aggregate(tap_id)) {
-        AudioHardwareDestroyProcessTap(tap_id);
-        return false;
-    }
-
-    size_t buffer_size = config_.buffer_frames * 2;
-    auto process_tap = std::make_unique<ProcessTap>(
-        pid,
-        tap_id,
-        config_.ringbuffer_capacity,
-        buffer_size
-    );
-    
-    process_taps_.push_back(std::move(process_tap));
-    return true;
 }
 
 bool AudioTapManager::add_tap_to_aggregate(AudioObjectID tap_id) {

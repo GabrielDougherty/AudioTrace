@@ -17,7 +17,7 @@ set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 
 # AudioCore library (pure C++23)
 add_library(AudioCore STATIC
-    AudioCore/AudioTapManager.cpp
+    AudioCore/AudioTapManager.mm
     AudioCore/AudioTapManager.hpp
     AudioCore/AudioAnalyzer.cpp
     AudioCore/AudioAnalyzer.hpp

@@ -1,6 +1,5 @@
 #include "AudioTapManager.hpp"
 #include <thread>
-#include <algorithm>
 #include <CoreFoundation/CoreFoundation.h>
 
 namespace AudioTrace {
@@ -23,6 +22,13 @@ bool AudioTapManager::start() {
         return false;
     }
 
+    // For demo: tap a few common processes
+    // TODO: Make this dynamic - enumerate running audio-capable processes
+    std::vector<pid_t> processes_to_tap;
+    
+    // We'll discover these dynamically later, for now use system processes
+    // This is just a starting point - we need process enumeration
+    
     // Start worker thread
     worker_should_stop_.store(false, std::memory_order_release);
     worker_thread_ = std::make_unique<std::thread>(
@@ -35,32 +41,7 @@ bool AudioTapManager::start() {
         audio_io_proc,
         this,
         &io_proc_id_
-    );
-    
-    if (status != noErr) {
-        stop();
-        return false;
-    }
-
-    // Start the aggregate device
-    status = AudioDeviceStart(aggregate_device_id_, io_proc_id_);
-    if (status != noErr) {
-        AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
-        io_proc_id_ = nullptr;
-        stop();
-        return false;
-    }
-
-    is_running_ = true;
-    return true;
-}
-
-void AudioTapManager::stop() {
-    if (!is_running_) {
-        return;
-    }
-
-    // Stop audio device
+    );top audio device
     if (aggregate_device_id_ != kAudioObjectUnknown && io_proc_id_ != nullptr) {
         AudioDeviceStop(aggregate_device_id_, io_proc_id_);
         AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
@@ -76,7 +57,32 @@ void AudioTapManager::stop() {
     worker_thread_.reset();
 
     // Destroy aggregate device and taps
-    destroy_aggregate_device();
+    destroy_aggregate_device();yIOProcID(aggregate_device_id_, io_proc_id_);
+        io_proc_id_ = nullptr;
+        stop();
+        return false;
+    }
+
+    is_running_ = true;
+    return true;
+}
+
+void AudioTapManager::stop() {
+    if (!is_running_) {
+        return;
+    }
+
+    // Signal worker thread to stop
+    worker_should_stop_.store(true, std::memory_order_release);
+    
+    if (worker_thread_ && worker_thread_->joinable()) {
+        worker_thread_->join();
+    }
+    worker_thread_.reset();
+
+    // TODO: Stop Core Audio device
+    // TODO: Remove IOProc
+    // TODO: Destroy taps
 
     process_taps_.clear();
     is_running_ = false;
@@ -98,6 +104,7 @@ std::vector<pid_t> AudioTapManager::get_tapped_processes() const {
 }
 
 void AudioTapManager::worker_thread_proc() {
+    // Worker thread: drain ring buffers and invoke callback
     while (!worker_should_stop_.load(std::memory_order_acquire)) {
         bool did_work = false;
 
@@ -112,21 +119,24 @@ void AudioTapManager::worker_thread_proc() {
         }
 
         if (!did_work) {
+            // Sleep briefly if no data available
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
     }
 }
 
 OSStatus AudioTapManager::audio_io_proc(
-    AudioDeviceID,
-    const AudioTimeStamp*,
+    AudioDeviceID inDevice,
+    const AudioTimeStamp* inNow,
     const AudioBufferList* inInputData,
     const AudioTimeStamp* inInputTime,
-    AudioBufferList*,
-    const AudioTimeStamp*,
+    AudioBufferList* outOutputData,
+    const AudioTimeStamp* inOutputTime,
     void* inClientData
 ) noexcept
 {
+    // REALTIME CONTEXT - NO ALLOCATIONS, NO LOCKS, NO OBJC
+    
     auto* manager = static_cast<AudioTapManager*>(inClientData);
     if (!manager || !inInputData) {
         return noErr;
@@ -140,9 +150,14 @@ OSStatus AudioTapManager::audio_io_proc(
 void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
                                          const AudioTimeStamp* timestamp) noexcept
 {
+    // REALTIME CONTEXT
+    
     if (!buffer_list || buffer_list->mNumberBuffers == 0) {
         return;
     }
+
+    // For now, assume all audio is interleaved and process all buffers
+    // TODO: Properly attribute audio to specific PIDs based on tap configuration
     
     for (uint32_t i = 0; i < buffer_list->mNumberBuffers; ++i) {
         const AudioBuffer& buffer = buffer_list->mBuffers[i];
@@ -151,11 +166,13 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
             continue;
         }
 
+        // Assuming float32 samples
         const float* samples = static_cast<const float*>(buffer.mData);
         const uint32_t sample_count = buffer.mDataByteSize / sizeof(float);
         const uint32_t channel_count = buffer.mNumberChannels;
         const uint32_t frame_count = sample_count / channel_count;
 
+        // For each tap, try to push data to its ring buffer
         for (auto& tap : process_taps_) {
             AudioTapData data;
             data.pid = tap->pid;
@@ -163,11 +180,13 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
             data.channel_count = channel_count;
             data.sample_time = timestamp ? timestamp->mSampleTime : 0;
             
-            const size_t copy_size = std::min(static_cast<size_t>(sample_count), tap->temp_buffer.size());
+            // Copy to pre-allocated buffer
+            const size_t copy_size = std::min(sample_count, tap->temp_buffer.size());
             std::copy_n(samples, copy_size, tap->temp_buffer.begin());
-            data.samples = tap->temp_buffer;
+            data.samples = tap->temp_buffer;  // This will copy, but we're in worker context
             
-            tap->ring_buffer.push(data);
+            // Try to push (non-blocking)
+            tap->ring_buffer.push(data);  // If full, oldest data is dropped
         }
     }
 }
@@ -178,7 +197,7 @@ AudioStreamBasicDescription AudioTapManager::get_stream_format() const {
     format.mFormatID = kAudioFormatLinearPCM;
     format.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked;
     format.mBitsPerChannel = 32;
-    format.mChannelsPerFrame = 2;
+    format.mChannelsPerFrame = 2;  // Stereo
     format.mBytesPerFrame = format.mChannelsPerFrame * sizeof(float);
     format.mFramesPerPacket = 1;
     format.mBytesPerPacket = format.mBytesPerFrame;
@@ -186,6 +205,7 @@ AudioStreamBasicDescription AudioTapManager::get_stream_format() const {
 }
 
 bool AudioTapManager::create_aggregate_device() {
+    // Create aggregate device configuration
     CFMutableDictionaryRef device_dict = CFDictionaryCreateMutable(
         kCFAllocatorDefault,
         0,
@@ -197,32 +217,42 @@ bool AudioTapManager::create_aggregate_device() {
         return false;
     }
 
+    // Set device name
     CFStringRef device_name = CFSTR("AudioTrace Tap Aggregate");
     CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceNameKey), device_name);
     
+    // Set device UID
     CFStringRef device_uid = CFSTR("com.audiotrace.aggregate");
     CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceUIDKey), device_uid);
 
+    // Create the aggregate device
     OSStatus status = AudioHardwareCreateAggregateDevice(device_dict, &aggregate_device_id_);
     CFRelease(device_dict);
     
-    return (status == noErr && aggregate_device_id_ != kAudioObjectUnknown);
+    if (status != noErr || aggregate_device_id_ == kAudioObjectUnknown) {
+        return false;
+    }
+
+    return true;
 }
 
 void AudioTapManager::destroy_aggregate_device() {
     if (aggregate_device_id_ != kAudioObjectUnknown) {
+        // Destroy all taps first
         for (auto& tap : process_taps_) {
             if (tap->tap_id != kAudioObjectUnknown) {
                 AudioHardwareDestroyProcessTap(tap->tap_id);
             }
         }
         
+        // Destroy aggregate device
         AudioHardwareDestroyAggregateDevice(aggregate_device_id_);
         aggregate_device_id_ = kAudioObjectUnknown;
     }
 }
 
 bool AudioTapManager::create_tap_for_process(pid_t pid) {
+    // Create tap description
     CATapDescription tap_desc{};
     tap_desc.mProcesses = CFArrayCreate(
         kCFAllocatorDefault,
@@ -235,16 +265,19 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         return false;
     }
 
+    // Add PID to the process list
     CFNumberRef pid_num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &pid);
     if (pid_num) {
         CFArrayAppendValue((CFMutableArrayRef)tap_desc.mProcesses, pid_num);
         CFRelease(pid_num);
     }
 
+    // Configure tap (stereo, don't mute original output)
     tap_desc.mMixdown = kCATapMixdownStereo;
     tap_desc.mMuteBehavior = kCATapMuteBehaviorUnmuted;
     tap_desc.mPrivacy = kCATapPrivacyPrivate;
 
+    // Create the tap
     AudioObjectID tap_id = kAudioObjectUnknown;
     OSStatus status = AudioHardwareCreateProcessTap(&tap_desc, &tap_id);
     
@@ -254,12 +287,14 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         return false;
     }
 
+    // Add tap to aggregate device
     if (!add_tap_to_aggregate(tap_id)) {
         AudioHardwareDestroyProcessTap(tap_id);
         return false;
     }
 
-    size_t buffer_size = config_.buffer_frames * 2;
+    // Create ProcessTap structure
+    size_t buffer_size = config_.buffer_frames * 2;  // Stereo
     auto process_tap = std::make_unique<ProcessTap>(
         pid,
         tap_id,
@@ -272,6 +307,7 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
 }
 
 bool AudioTapManager::add_tap_to_aggregate(AudioObjectID tap_id) {
+    // Get tap's UID
     CFStringRef tap_uid = nullptr;
     UInt32 data_size = sizeof(tap_uid);
     AudioObjectPropertyAddress prop_addr{
@@ -293,6 +329,7 @@ bool AudioTapManager::add_tap_to_aggregate(AudioObjectID tap_id) {
         return false;
     }
 
+    // Create array with tap UID
     CFStringRef uid_array[] = { tap_uid };
     CFArrayRef taps = CFArrayCreate(
         kCFAllocatorDefault,
@@ -306,6 +343,7 @@ bool AudioTapManager::add_tap_to_aggregate(AudioObjectID tap_id) {
         return false;
     }
 
+    // Set the tap list on the aggregate device
     AudioObjectPropertyAddress tap_list_addr{
         kAudioAggregateDevicePropertyTapList,
         kAudioObjectPropertyScopeGlobal,

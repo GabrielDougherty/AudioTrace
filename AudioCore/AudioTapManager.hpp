@@ -57,17 +57,22 @@ private:
     bool is_running_ = false;
     AudioCallback audio_callback_;
 
-    // TODO: Core Audio tap objects
-    // std::vector<AudioDeviceTap> taps_;
+    // Core Audio tap and aggregate device
+    AudioObjectID aggregate_device_id_ = kAudioObjectUnknown;
+    AudioDeviceIOProcID io_proc_id_ = nullptr;
     
     // Ring buffers for each tapped process (realtime -> worker)
     struct ProcessTap {
         pid_t pid;
+        AudioObjectID tap_id;
         RingBuffer<AudioTapData> ring_buffer;
-        // TODO: Core Audio tap handle
+        std::vector<float> temp_buffer;  // Pre-allocated for realtime use
         
-        ProcessTap(pid_t p, size_t capacity)
-            : pid(p), ring_buffer(capacity)
+        ProcessTap(pid_t p, AudioObjectID tap, size_t capacity, size_t buffer_size)
+            : pid(p)
+            , tap_id(tap)
+            , ring_buffer(capacity)
+            , temp_buffer(buffer_size)
         {}
     };
     
@@ -78,8 +83,14 @@ private:
     std::unique_ptr<std::thread> worker_thread_;
     std::atomic<bool> worker_should_stop_{false};
 
+    // Helper methods
+    bool create_aggregate_device();
+    void destroy_aggregate_device();
+    bool create_tap_for_process(pid_t pid);
+    bool add_tap_to_aggregate(AudioObjectID tap_id);
+    AudioStreamBasicDescription get_stream_format() const;
+
     // Core Audio callback (REALTIME SAFE)
-    // TODO: Implement actual Core Audio IOProc
     static OSStatus audio_io_proc(
         AudioDeviceID inDevice,
         const AudioTimeStamp* inNow,
@@ -90,7 +101,8 @@ private:
         void* inClientData
     ) noexcept;
 
-    void process_audio_buffers() noexcept;
+    void process_input_data(const AudioBufferList* buffer_list, 
+                           const AudioTimeStamp* timestamp) noexcept;
 };
 
 }  // namespace AudioTrace
