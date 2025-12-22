@@ -34,8 +34,6 @@ bool AudioTapManager::start() {
     
     if (process_objects.empty()) {
         NSLog(@"No audio processes found - creating tap for system audio");
-        // Fallback: tap system-wide audio by using the system object
-        // This will trigger the permission prompt!
         if (!create_tap_for_system()) {
             NSLog(@"Failed to create system audio tap");
             return false;
@@ -58,7 +56,7 @@ bool AudioTapManager::start() {
         }
     }
     
-    // Step 2: Collect tap UIDs
+    // Step 2: Collect tap UIDs for aggregate device
     std::vector<CFStringRef> tap_uids;
     for (const auto& tap : process_taps_) {
         CFStringRef tap_uid = nullptr;
@@ -85,25 +83,23 @@ bool AudioTapManager::start() {
 
     // Step 3: Create aggregate device with taps
     if (!create_aggregate_device(tap_uids)) {
-        // Clean up tap UIDs
         for (auto uid : tap_uids) {
             if (uid) CFRelease(uid);
         }
         return false;
     }
     
-    // Clean up tap UIDs
     for (auto uid : tap_uids) {
         if (uid) CFRelease(uid);
     }
 
-    // Start worker thread
+    // Step 4: Start worker thread
     worker_should_stop_.store(false, std::memory_order_release);
     worker_thread_ = std::make_unique<std::thread>(
         &AudioTapManager::worker_thread_proc, this
     );
 
-    // Register IOProc callback for aggregate device
+    // Step 5: Register IOProc callback for aggregate device
     OSStatus status = AudioDeviceCreateIOProcID(
         aggregate_device_id_,
         audio_io_proc,
@@ -116,9 +112,8 @@ bool AudioTapManager::start() {
         stop();
         return false;
     }
-    NSLog(@"✅ Created IOProcID for aggregate device %u", aggregate_device_id_);
 
-    // Start the aggregate device
+    // Step 6: Start the aggregate device
     status = AudioDeviceStart(aggregate_device_id_, io_proc_id_);
     if (status != noErr) {
         NSLog(@"❌ Failed to start aggregate device: %d", status);
@@ -127,8 +122,8 @@ bool AudioTapManager::start() {
         stop();
         return false;
     }
-    NSLog(@"✅ Started aggregate device %u", aggregate_device_id_);
 
+    NSLog(@"🎉 Started aggregate device with %zu taps", process_taps_.size());
     is_running_ = true;
     return true;
 }
@@ -138,7 +133,7 @@ void AudioTapManager::stop() {
         return;
     }
 
-    // Stop audio device
+    // Stop aggregate device
     if (aggregate_device_id_ != kAudioObjectUnknown && io_proc_id_ != nullptr) {
         AudioDeviceStop(aggregate_device_id_, io_proc_id_);
         AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
@@ -267,10 +262,24 @@ OSStatus AudioTapManager::audio_io_proc(
         return noErr;
     }
 
-    static int callback_count = 0;
-    if (++callback_count % 1000 == 0) {
+    static std::atomic<int> callback_count{0};
+    int count = ++callback_count;
+    if (count % 1000 == 0) {
         NSLog(@"🎤 Audio callback fired %d times, %u buffers", 
-              callback_count, inInputData->mNumberBuffers);
+              count, inInputData->mNumberBuffers);
+        
+        // Debug: Check first buffer's data
+        if (inInputData->mNumberBuffers > 0) {
+            const AudioBuffer& buf = inInputData->mBuffers[0];
+            NSLog(@"  Buffer 0: channels=%u, dataSize=%u bytes", 
+                  buf.mNumberChannels, buf.mDataByteSize);
+            
+            if (buf.mData && buf.mDataByteSize >= sizeof(float) * 4) {
+                const float* samples = static_cast<const float*>(buf.mData);
+                NSLog(@"  First samples: %.6f, %.6f, %.6f, %.6f", 
+                      samples[0], samples[1], samples[2], samples[3]);
+            }
+        }
     }
 
     manager->process_input_data(inInputData, inInputTime);
@@ -286,7 +295,6 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
     }
     
     // Each buffer in the aggregate device corresponds to one tap
-    // Buffer index i should match tap index i
     const uint32_t num_buffers = std::min(
         static_cast<uint32_t>(buffer_list->mNumberBuffers),
         static_cast<uint32_t>(process_taps_.size())
@@ -304,7 +312,7 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         const uint32_t channel_count = buffer.mNumberChannels;
         const uint32_t frame_count = sample_count / channel_count;
 
-        // Send this buffer only to the corresponding tap
+        // Send this buffer to the corresponding tap
         auto& tap = process_taps_[i];
         AudioTapData data;
         data.pid = tap->pid;
@@ -316,7 +324,12 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         std::copy_n(samples, copy_size, tap->temp_buffer.begin());
         data.samples = tap->temp_buffer;
         
-        tap->ring_buffer.push(data);
+        if (!tap->ring_buffer.push(data)) {
+            static std::atomic<int> drop_count{0};
+            if (++drop_count % 100 == 0) {
+                NSLog(@"⚠️ Dropped %d buffers (ring buffer full)", drop_count.load());
+            }
+        }
     }
 }
 
@@ -331,102 +344,6 @@ AudioStreamBasicDescription AudioTapManager::get_stream_format() const {
     format.mFramesPerPacket = 1;
     format.mBytesPerPacket = format.mBytesPerFrame;
     return format;
-}
-
-bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& tap_uids) {
-    CFMutableDictionaryRef device_dict = CFDictionaryCreateMutable(
-        kCFAllocatorDefault,
-        0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks
-    );
-    
-    if (!device_dict) {
-        return false;
-    }
-
-    // Generate unique UID for this aggregate device
-    CFUUIDRef uuid = CFUUIDCreate(kCFAllocatorDefault);
-    CFStringRef device_uid = CFUUIDCreateString(kCFAllocatorDefault, uuid);
-    CFRelease(uuid);
-    
-    CFStringRef device_name = CFSTR("AudioTrace Tap Aggregate");
-    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceNameKey), device_name);
-    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceUIDKey), device_uid);
-    
-    // Make it private (not visible system-wide)
-    int is_private_value = 1;
-    CFNumberRef is_private = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &is_private_value);
-    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceIsPrivateKey), is_private);
-    CFRelease(is_private);
-    
-    // Disable stacking (we want taps as separate streams)
-    int is_stacked_value = 0;
-    CFNumberRef is_stacked = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &is_stacked_value);
-    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceIsStackedKey), is_stacked);
-    CFRelease(is_stacked);
-    
-    // Enable auto-start for taps
-    int auto_start_value = 1;
-    CFNumberRef auto_start = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &auto_start_value);
-    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceTapAutoStartKey), auto_start);
-    CFRelease(auto_start);
-    
-    // Add taps to aggregate device if we have any
-    if (!tap_uids.empty()) {
-        CFMutableArrayRef tap_list = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-        
-        for (CFStringRef tap_uid : tap_uids) {
-            // Create sub-tap dictionary with drift compensation enabled
-            CFMutableDictionaryRef sub_tap = CFDictionaryCreateMutable(
-                kCFAllocatorDefault,
-                0,
-                &kCFTypeDictionaryKeyCallBacks,
-                &kCFTypeDictionaryValueCallBacks
-            );
-            
-            CFDictionarySetValue(sub_tap, CFSTR(kAudioSubTapUIDKey), tap_uid);
-            
-            // Enable drift compensation
-            int drift_comp_value = 1;
-            CFNumberRef drift_comp = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &drift_comp_value);
-            CFDictionarySetValue(sub_tap, CFSTR(kAudioSubTapDriftCompensationKey), drift_comp);
-            CFRelease(drift_comp);
-            
-            CFArrayAppendValue(tap_list, sub_tap);
-            CFRelease(sub_tap);
-        }
-        
-        CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceTapListKey), tap_list);
-        CFRelease(tap_list);
-    }
-
-    OSStatus status = AudioHardwareCreateAggregateDevice(device_dict, &aggregate_device_id_);
-    
-    CFRelease(device_uid);
-    CFRelease(device_dict);
-    
-    if (status != noErr) {
-        NSLog(@"AudioHardwareCreateAggregateDevice failed with status %d", (int)status);
-        return false;
-    }
-    
-    NSLog(@"✅ Created aggregate device with %zu taps", tap_uids.size());
-    
-    return aggregate_device_id_ != kAudioObjectUnknown;
-}
-
-void AudioTapManager::destroy_aggregate_device() {
-    if (aggregate_device_id_ != kAudioObjectUnknown) {
-        for (auto& tap : process_taps_) {
-            if (tap->tap_id != kAudioObjectUnknown) {
-                AudioHardwareDestroyProcessTap(tap->tap_id);
-            }
-        }
-        
-        AudioHardwareDestroyAggregateDevice(aggregate_device_id_);
-        aggregate_device_id_ = kAudioObjectUnknown;
-    }
 }
 
 bool AudioTapManager::create_tap_for_process(pid_t pid) {
@@ -587,6 +504,105 @@ bool AudioTapManager::create_tap_for_system() {
         process_taps_.push_back(std::move(process_tap));
         NSLog(@"✓ Created system-wide audio tap %u", tap_id);
         return true;
+    }
+}
+
+bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& tap_uids) {
+    CFMutableDictionaryRef device_dict = CFDictionaryCreateMutable(
+        kCFAllocatorDefault,
+        0,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks
+    );
+    
+    if (!device_dict) {
+        return false;
+    }
+
+    // Generate unique UID for this aggregate device
+    CFUUIDRef uuid = CFUUIDCreate(kCFAllocatorDefault);
+    CFStringRef device_uid = CFUUIDCreateString(kCFAllocatorDefault, uuid);
+    CFRelease(uuid);
+    
+    CFStringRef device_name = CFSTR("AudioTrace Tap Aggregate");
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceNameKey), device_name);
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceUIDKey), device_uid);
+    
+    // Make it private (not visible system-wide)
+    int is_private_value = 1;
+    CFNumberRef is_private = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &is_private_value);
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceIsPrivateKey), is_private);
+    CFRelease(is_private);
+    
+    // Disable stacking (we want taps as separate streams/buffers)
+    int is_stacked_value = 0;
+    CFNumberRef is_stacked = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &is_stacked_value);
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceIsStackedKey), is_stacked);
+    CFRelease(is_stacked);
+    
+    // Enable auto-start for taps
+    int auto_start_value = 1;
+    CFNumberRef auto_start = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &auto_start_value);
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceTapAutoStartKey), auto_start);
+    CFRelease(auto_start);
+    
+    // Add taps to aggregate device if we have any
+    if (!tap_uids.empty()) {
+        CFMutableArrayRef tap_list = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        
+        for (CFStringRef tap_uid : tap_uids) {
+            // Create sub-tap dictionary with drift compensation enabled
+            CFMutableDictionaryRef sub_tap = CFDictionaryCreateMutable(
+                kCFAllocatorDefault,
+                0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks
+            );
+            
+            CFDictionarySetValue(sub_tap, CFSTR(kAudioSubTapUIDKey), tap_uid);
+            
+            // Enable drift compensation
+            int drift_comp_value = 1;
+            CFNumberRef drift_comp = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &drift_comp_value);
+            CFDictionarySetValue(sub_tap, CFSTR(kAudioSubTapDriftCompensationKey), drift_comp);
+            CFRelease(drift_comp);
+            
+            CFArrayAppendValue(tap_list, sub_tap);
+            CFRelease(sub_tap);
+        }
+        
+        CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceTapListKey), tap_list);
+        CFRelease(tap_list);
+    }
+
+    OSStatus status = AudioHardwareCreateAggregateDevice(device_dict, &aggregate_device_id_);
+    
+    CFRelease(device_uid);
+    CFRelease(device_dict);
+    
+    if (status != noErr) {
+        NSLog(@"AudioHardwareCreateAggregateDevice failed with status %d", (int)status);
+        return false;
+    }
+    
+    NSLog(@"✅ Created aggregate device %u with %zu taps", aggregate_device_id_, tap_uids.size());
+    
+    return aggregate_device_id_ != kAudioObjectUnknown;
+}
+
+void AudioTapManager::destroy_aggregate_device() {
+    if (aggregate_device_id_ != kAudioObjectUnknown) {
+        // Destroy all taps first
+        for (auto& tap : process_taps_) {
+            if (tap->tap_id != kAudioObjectUnknown) {
+                AudioHardwareDestroyProcessTap(tap->tap_id);
+                tap->tap_id = kAudioObjectUnknown;
+            }
+        }
+        
+        // Then destroy the aggregate device
+        AudioHardwareDestroyAggregateDevice(aggregate_device_id_);
+        aggregate_device_id_ = kAudioObjectUnknown;
     }
 }
 
