@@ -10,7 +10,7 @@ ActivityTracker::ActivityTracker(Config config)
 ActivityTracker::~ActivityTracker() = default;
 
 void ActivityTracker::record_activity(const ActivityEvent& event) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_);
     
     activities_[event.pid] = ProcessActivity{
         .last_heard = event.timestamp,
@@ -20,7 +20,7 @@ void ActivityTracker::record_activity(const ActivityEvent& event) {
 }
 
 std::vector<ActivitySnapshot> ActivityTracker::snapshot() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_);
     
     const auto now = std::chrono::steady_clock::now();
     std::vector<ActivitySnapshot> result;
@@ -49,7 +49,7 @@ std::vector<ActivitySnapshot> ActivityTracker::snapshot() const {
 }
 
 void ActivityTracker::cleanup_expired() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_);
     
     const auto now = std::chrono::steady_clock::now();
     const auto expiry_threshold = now - config_.expiry_time;
@@ -65,7 +65,7 @@ void ActivityTracker::cleanup_expired() {
 }
 
 size_t ActivityTracker::process_count() const {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::scoped_lock lock(mutex_);
     return activities_.size();
 }
 
