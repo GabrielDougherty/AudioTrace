@@ -9,6 +9,15 @@ namespace AudioTrace {
 
 AudioTapManager::AudioTapManager(Config config)
     : config_(config)
+    , analyzer_(AudioAnalyzer::Config{
+        .silence_threshold_rms = 0.001f,  // ~-60dB
+        .active_threshold_rms = 0.005f,   // ~-46dB (hysteresis)
+        .window_frames = 2048
+      })
+    , tracker_(ActivityTracker::Config{
+        .current_threshold = std::chrono::milliseconds(500),
+        .expiry_time = std::chrono::minutes(2)
+      })
 {}
 
 AudioTapManager::~AudioTapManager() {
@@ -20,9 +29,72 @@ bool AudioTapManager::start() {
         return false;
     }
 
-    // Create aggregate device
-    if (!create_aggregate_device()) {
+    // Step 1: Discover and create process taps
+    std::vector<AudioObjectID> process_objects = discover_audio_processes();
+    
+    if (process_objects.empty()) {
+        NSLog(@"No audio processes found - creating tap for system audio");
+        // Fallback: tap system-wide audio by using the system object
+        // This will trigger the permission prompt!
+        if (!create_tap_for_system()) {
+            NSLog(@"Failed to create system audio tap");
+            return false;
+        }
+    } else {
+        // Create taps for discovered processes
+        for (AudioObjectID obj_id : process_objects) {
+            pid_t pid = get_pid_from_audio_object(obj_id);
+            if (pid > 0) {
+                NSLog(@"Creating tap for PID %d", pid);
+                create_tap_for_process(pid);
+            }
+        }
+        
+        if (process_taps_.empty()) {
+            NSLog(@"Failed to create any process taps, falling back to system audio");
+            if (!create_tap_for_system()) {
+                return false;
+            }
+        }
+    }
+    
+    // Step 2: Collect tap UIDs
+    std::vector<CFStringRef> tap_uids;
+    for (const auto& tap : process_taps_) {
+        CFStringRef tap_uid = nullptr;
+        UInt32 data_size = sizeof(tap_uid);
+        AudioObjectPropertyAddress prop_addr{
+            kAudioTapPropertyUID,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        
+        OSStatus status = AudioObjectGetPropertyData(
+            tap->tap_id,
+            &prop_addr,
+            0,
+            nullptr,
+            &data_size,
+            &tap_uid
+        );
+        
+        if (status == noErr && tap_uid) {
+            tap_uids.push_back(tap_uid);
+        }
+    }
+
+    // Step 3: Create aggregate device with taps
+    if (!create_aggregate_device(tap_uids)) {
+        // Clean up tap UIDs
+        for (auto uid : tap_uids) {
+            if (uid) CFRelease(uid);
+        }
         return false;
+    }
+    
+    // Clean up tap UIDs
+    for (auto uid : tap_uids) {
+        if (uid) CFRelease(uid);
     }
 
     // Start worker thread
@@ -88,7 +160,11 @@ void AudioTapManager::set_audio_callback(AudioCallback callback) {
     audio_callback_ = std::move(callback);
 }
 
-std::vector<pid_t> AudioTapManager::get_tapped_processes() const {
+s
+
+std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
+    return tracker_.snapshot();
+}td::vector<pid_t> AudioTapManager::get_tapped_processes() const {
     std::vector<pid_t> result;
     result.reserve(process_taps_.size());
     
@@ -97,15 +173,38 @@ std::vector<pid_t> AudioTapManager::get_tapped_processes() const {
     }
     
     return result;
-}
+}// Analyze audio for activity
+                auto event = analyzer_.analyze(
+                    data.samples.data(),
+                    data.frame_count,
+                    data.channel_count,
+                    data.pid,
+                    std::chrono::steady_clock::now()
+                );
+                
+                if (event) {
+                    // Record activity
+                    tracker_.record_activity(*event);
+                    
+                    // Also call user callback if set
+                    if (audio_callback_) {
+                        audio_callback_(data);
+                    }
+                }
+                
+                did_work = true;
+            }
+        }
 
-void AudioTapManager::worker_thread_proc() {
-    while (!worker_should_stop_.load(std::memory_order_acquire)) {
-        bool did_work = false;
-
-        for (auto& tap : process_taps_) {
-            AudioTapData data;
-            while (tap->ring_buffer.pop(data)) {
+        if (!did_work) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        } else {
+            // Periodically cleanup expired entries
+            static int cleanup_counter = 0;
+            if (++cleanup_counter > 100) {
+                tracker_.cleanup_expired();
+                cleanup_counter = 0;
+            }
                 if (audio_callback_) {
                     audio_callback_(data);
                 }
@@ -187,7 +286,7 @@ AudioStreamBasicDescription AudioTapManager::get_stream_format() const {
     return format;
 }
 
-bool AudioTapManager::create_aggregate_device() {
+bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& tap_uids) {
     CFMutableDictionaryRef device_dict = CFDictionaryCreateMutable(
         kCFAllocatorDefault,
         0,
@@ -199,16 +298,54 @@ bool AudioTapManager::create_aggregate_device() {
         return false;
     }
 
+    // Generate unique UID for this aggregate device
+    CFUUIDRef uuid = CFUUIDCreate(kCFAllocatorDefault);
+    CFStringRef device_uid = CFUUIDCreateString(kCFAllocatorDefault, uuid);
+    CFRelease(uuid);
+    
     CFStringRef device_name = CFSTR("AudioTrace Tap Aggregate");
     CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceNameKey), device_name);
-    
-    CFStringRef device_uid = CFSTR("com.audiotrace.aggregate");
     CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceUIDKey), device_uid);
+    
+    // Make it private (not visible system-wide)
+    int is_private_value = 1;
+    CFNumberRef is_private = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &is_private_value);
+    CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceIsPrivateKey), is_private);
+    CFRelease(is_private);
+    
+    // Add taps to aggregate device if we have any
+    if (!tap_uids.empty()) {
+        CFMutableArrayRef tap_list = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+        
+        for (CFStringRef tap_uid : tap_uids) {
+            // Create sub-tap dictionary
+            CFMutableDictionaryRef sub_tap = CFDictionaryCreateMutable(
+                kCFAllocatorDefault,
+                0,
+                &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks
+            );
+            
+            CFDictionarySetValue(sub_tap, CFSTR(kAudioSubTapUIDKey), tap_uid);
+            CFArrayAppendValue(tap_list, sub_tap);
+            CFRelease(sub_tap);
+        }
+        
+        CFDictionarySetValue(device_dict, CFSTR(kAudioAggregateDeviceTapListKey), tap_list);
+        CFRelease(tap_list);
+    }
 
     OSStatus status = AudioHardwareCreateAggregateDevice(device_dict, &aggregate_device_id_);
+    
+    CFRelease(device_uid);
     CFRelease(device_dict);
     
-    return (status == noErr && aggregate_device_id_ != kAudioObjectUnknown);
+    if (status != noErr) {
+        NSLog(@"AudioHardwareCreateAggregateDevice failed with status %d", (int)status);
+        return false;
+    }
+    
+    return aggregate_device_id_ != kAudioObjectUnknown;
 }
 
 void AudioTapManager::destroy_aggregate_device() {
@@ -226,8 +363,33 @@ void AudioTapManager::destroy_aggregate_device() {
 
 bool AudioTapManager::create_tap_for_process(pid_t pid) {
     @autoreleasepool {
+        // Translate PID to AudioObjectID first
+        AudioObjectPropertyAddress prop_addr{
+            kAudioHardwarePropertyTranslatePIDToProcessObject,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        
+        AudioObjectID process_obj_id = kAudioObjectUnknown;
+        UInt32 data_size = sizeof(process_obj_id);
+        pid_t input_pid = pid;
+        
+        OSStatus status = AudioObjectGetPropertyData(
+            kAudioObjectSystemObject,
+            &prop_addr,
+            sizeof(pid_t),
+            &input_pid,
+            &data_size,
+            &process_obj_id
+        );
+        
+        if (status != noErr || process_obj_id == kAudioObjectUnknown) {
+            NSLog(@"Failed to translate PID %d to AudioObjectID, status: %d", pid, (int)status);
+            return false;
+        }
+        
         // Create array of process AudioObjectIDs
-        NSNumber* processID = @(pid);
+        NSNumber* processID = @(process_obj_id);
         NSArray<NSNumber*>* processes = @[processID];
         
         // Create tap description (stereo mixdown of this process)
@@ -239,17 +401,12 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         // Set mute behavior (don't mute original audio)
         tapDesc.muteBehavior = CATapUnmuted;
         
-        // Create the tap
+        // Create the tap - THIS WILL TRIGGER THE PERMISSION PROMPT!
         AudioObjectID tap_id = kAudioObjectUnknown;
-        OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
+        status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
         
         if (status != noErr || tap_id == kAudioObjectUnknown) {
-            return false;
-        }
-
-        // Add tap to aggregate device
-        if (!add_tap_to_aggregate(tap_id)) {
-            AudioHardwareDestroyProcessTap(tap_id);
+            NSLog(@"AudioHardwareCreateProcessTap failed for PID %d with status %d", pid, (int)status);
             return false;
         }
 
@@ -263,65 +420,106 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         );
         
         process_taps_.push_back(std::move(process_tap));
+        NSLog(@"✓ Created tap %u for PID %d", tap_id, pid);
         return true;
     }
 }
 
-bool AudioTapManager::add_tap_to_aggregate(AudioObjectID tap_id) {
-    CFStringRef tap_uid = nullptr;
-    UInt32 data_size = sizeof(tap_uid);
+std::vector<AudioObjectID> AudioTapManager::discover_audio_processes() {
+    std::vector<AudioObjectID> result;
+    
     AudioObjectPropertyAddress prop_addr{
-        kAudioTapPropertyUID,
+        kAudioHardwarePropertyProcessObjectList,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
     
-    OSStatus status = AudioObjectGetPropertyData(
-        tap_id,
+    UInt32 data_size = 0;
+    OSStatus status = AudioObjectGetPropertyDataSize(
+        kAudioObjectSystemObject,
+        &prop_addr,
+        0,
+        nullptr,
+        &data_size
+    );
+    
+    if (status != noErr || data_size == 0) {
+        return result;
+    }
+    
+    UInt32 count = data_size / sizeof(AudioObjectID);
+    result.resize(count);
+    
+    status = AudioObjectGetPropertyData(
+        kAudioObjectSystemObject,
         &prop_addr,
         0,
         nullptr,
         &data_size,
-        &tap_uid
+        result.data()
     );
     
-    if (status != noErr || !tap_uid) {
-        return false;
+    if (status != noErr) {
+        result.clear();
     }
-
-    CFStringRef uid_array[] = { tap_uid };
-    CFArrayRef taps = CFArrayCreate(
-        kCFAllocatorDefault,
-        (const void**)uid_array,
-        1,
-        &kCFTypeArrayCallBacks
-    );
     
-    if (!taps) {
-        CFRelease(tap_uid);
-        return false;
-    }
+    return result;
+}
 
-    AudioObjectPropertyAddress tap_list_addr{
-        kAudioAggregateDevicePropertyTapList,
+pid_t AudioTapManager::get_pid_from_audio_object(AudioObjectID obj_id) {
+    AudioObjectPropertyAddress prop_addr{
+        kAudioProcessPropertyPID,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
     
-    data_size = sizeof(CFArrayRef);
-    status = AudioObjectSetPropertyData(
-        aggregate_device_id_,
-        &tap_list_addr,
+    pid_t pid = -1;
+    UInt32 data_size = sizeof(pid);
+    
+    OSStatus status = AudioObjectGetPropertyData(
+        obj_id,
+        &prop_addr,
         0,
         nullptr,
-        data_size,
-        &taps
+        &data_size,
+        &pid
     );
     
-    CFRelease(taps);
-    CFRelease(tap_uid);
-    
-    return status == noErr;
+    return (status == noErr) ? pid : -1;
+}
+
+bool AudioTapManager::create_tap_for_system() {
+    // For system-wide audio, we'll create a stereo mixdown tap
+    @autoreleasepool {
+        // Create a stereo mixdown tap with empty process list for system-wide audio
+        CATapDescription* tapDesc = [[CATapDescription alloc] initStereoGlobalTapWithProcesses:@[]];
+        if (!tapDesc) {
+            return false;
+        }
+        
+        // Don't mute the system audio
+        tapDesc.muteBehavior = CATapUnmuted;
+        
+        AudioObjectID tap_id = kAudioObjectUnknown;
+        OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
+        
+        if (status != noErr || tap_id == kAudioObjectUnknown) {
+            NSLog(@"Failed to create system-wide tap, status: %d", (int)status);
+            return false;
+        }
+        
+        size_t buffer_size = config_.buffer_frames * 2;
+        auto process_tap = std::make_unique<ProcessTap>(
+            0,  // PID 0 = system-wide
+            tap_id,
+            config_.ringbuffer_capacity,
+            buffer_size
+        );
+        
+        process_taps_.push_back(std::move(process_tap));
+        NSLog(@"✓ Created system-wide audio tap %u", tap_id);
+        return true;
+    }
 }
 
 }  // namespace AudioTrace

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "RingBuffer.hpp"
+#include "AudioAnalyzer.hpp"
+#include "ActivityTracker.hpp"
 #include <CoreAudio/CoreAudio.h>
 #include <AudioToolbox/AudioToolbox.h>
 #include <memory>
@@ -49,11 +51,18 @@ public:
     /// Set callback for audio data (called from worker thread, not realtime)
     void set_audio_callback(AudioCallback callback);
 
+    
+    /// Get activity snapshot for UI
+    std::vector<ActivitySnapshot> get_activity_snapshot() const;
     /// Get list of currently tapped process IDs
     std::vector<pid_t> get_tapped_processes() const;
 
 private:
     Config config_;
+    
+    // Audio analysis components
+    AudioAnalyzer analyzer_;
+    ActivityTracker tracker_;
     bool is_running_ = false;
     AudioCallback audio_callback_;
 
@@ -84,10 +93,12 @@ private:
     std::atomic<bool> worker_should_stop_{false};
 
     // Helper methods
-    bool create_aggregate_device();
+    bool create_aggregate_device(const std::vector<CFStringRef>& tap_uids);
     void destroy_aggregate_device();
     bool create_tap_for_process(pid_t pid);
-    bool add_tap_to_aggregate(AudioObjectID tap_id);
+    bool create_tap_for_system();
+    std::vector<AudioObjectID> discover_audio_processes();
+    pid_t get_pid_from_audio_object(AudioObjectID obj_id);
     AudioStreamBasicDescription get_stream_format() const;
 
     // Core Audio callback (REALTIME SAFE)

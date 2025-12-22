@@ -6,16 +6,16 @@
     <string>en</string>
     
     <key>CFBundleExecutable</key>
-    <string>$(EXECUTABLE_NAME)</string>
+    <string>AudioTrace</string>
     
     <key>CFBundleIdentifier</key>
-    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <string>com.audiotrace.app</string>
     
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     
     <key>CFBundleName</key>
-    <string>$(PRODUCT_NAME)</string>
+    <string>AudioTrace</string>
     
     <key>CFBundlePackageType</key>
     <string>APPL</string>
@@ -38,13 +38,9 @@
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     
-    <!-- Audio capture permission -->
-    <key>NSMicrophoneUsageDescription</key>
-    <string>AudioTrace monitors which applications are producing sound. We do not record or save any audio data.</string>
-    
-    <!-- System audio access may also require this -->
-    <key>NSAppleEventsUsageDescription</key>
-    <string>AudioTrace needs to detect running applications to show which ones are playing audio.</string>
+    <!-- Audio capture permission (required for Core Audio taps on macOS 14.4+) -->
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>AudioTrace monitors which applications are producing sound to display activity in the menu bar. No audio data is recorded or stored.</string>
     
     <!-- Application doesn't appear in Dock -->
     <key>LSBackgroundOnly</key>
