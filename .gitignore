@@ -21,3 +21,8 @@ DerivedData/
 *.swp
 *.swo
 *~
+
+# OCaml/Dune
+_build/
+*.install
+.merlin

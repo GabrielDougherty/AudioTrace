@@ -1,0 +1,9 @@
+(library
+ (name audio_generator)
+ (modules audio_generator)
+ (libraries unix))
+
+(executable
+ (name test_silence_issue)
+ (modules test_silence_issue)
+ (libraries unix str audio_generator))

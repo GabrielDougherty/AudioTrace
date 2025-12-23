@@ -32,10 +32,10 @@
     tap_config.buffer_frames = 512;
     _tapManager = std::make_unique<AudioTrace::AudioTapManager>(tap_config);
 
-    // Start audio capture - THIS WILL TRIGGER PERMISSION PROMPT!
+    // Start audio capture - will trigger permission prompt if needed
     bool started = _tapManager->start();
     if (!started) {
-        NSLog(@"Warning: Failed to start audio tap manager");
+        NSLog(@"⚠️  Failed to start audio tap manager");
         NSLog(@"Check System Settings > Privacy & Security > Screen Recording");
     } else {
         NSLog(@"✓ Audio tap manager started successfully");

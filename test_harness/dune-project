@@ -1,0 +1,12 @@
+(lang dune 3.7)
+(name audiotrace_test)
+(version 0.1.0)
+
+(package
+ (name audiotrace_test)
+ (allow_empty)
+ (synopsis "Test harness for AudioTrace silence issue")
+ (description "Demonstrates that AudioTrace captures only silence")
+ (depends
+  (ocaml (>= 5.0))
+  dune))

@@ -11,6 +11,7 @@
 #include <thread>
 #include <atomic>
 #include <sys/types.h>
+#include <cstdlib>
 
 namespace AudioTrace {
 
@@ -58,6 +59,14 @@ public:
     std::vector<pid_t> get_tapped_processes() const;
 
 private:
+    AudioObjectID find_process_object_for_pid(pid_t pid);
+    void log_available_audio_processes();
+
+    // Debug controls (set via environment variables)
+    bool debug_log_buffers_ = false;
+    bool debug_global_only_ = false;
+    pid_t debug_single_pid_ = -1;
+
     Config config_;
     
     // Audio analysis components
