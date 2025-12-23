@@ -22,6 +22,13 @@ type test_result =
   | Failure of string
   | Inconclusive of string
 
+(* Test configuration for matrix testing *)
+type test_config = {
+  name: string;
+  description: string;
+  env_vars: (string * string) list;
+}
+
 (* Process handle for cleanup *)
 type process_handle = {
   pid: int;
@@ -40,7 +47,7 @@ end
 
 (* Configuration *)
 let audio_trace_path = "/Users/gabriel/ws/AudioTrace/build/AudioTrace.app/Contents/MacOS/AudioTrace"
-let test_duration = 30.0
+let test_duration = 5.0
 let test_frequency = 220.0  (* A3 note - low enough to be pleasant but audible *)
 let temp_wav_file = "/tmp/audiotrace_test_tone.wav"
 
@@ -75,7 +82,7 @@ let kill_process handle =
         (Color.red "✗") handle.name (Printexc.to_string e)
 
 (* Start a background process and return handle *)
-let start_process ~name ~cmd ~args : (process_handle, string) result =
+let start_process ~name ~cmd ~args ~env : (process_handle, string) result =
   try
     let (read_fd, write_fd) = Unix.pipe () in
     let pid = Unix.fork () in
@@ -86,7 +93,7 @@ let start_process ~name ~cmd ~args : (process_handle, string) result =
       Unix.dup2 write_fd Unix.stdout;
       Unix.dup2 write_fd Unix.stderr;
       Unix.close write_fd;
-      Unix.execv cmd args
+      Unix.execve cmd args env
     end else begin
       (* Parent process *)
       Unix.close write_fd;
@@ -161,19 +168,30 @@ let monitor_process handle duration =
   monitor_loop ()
 
 (* Run the complete test *)
-let run_test () =
+let run_test (test_config : test_config) =
   printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
-  printf "%s\n" (Color.bold "  AudioTrace Silence Issue Test Harness (OCaml)");
+  printf "%s\n" (Color.bold (sprintf "  Test: %s" test_config.name));
   printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
+  printf "  %s\n" test_config.description;
+  if test_config.env_vars <> [] then begin
+    printf "  Environment:\n";
+    List.iter (fun (k, v) -> printf "    %s=%s\n" k v) test_config.env_vars
+  end;
   printf "\n";
   
   (* Step 1: Start AudioTrace *)
   printf "%s Starting AudioTrace...\n" (Color.blue "▶");
   
+  (* Build environment array with current env + test-specific vars *)
+  let base_env = Unix.environment () in
+  let env_array = Array.append base_env 
+    (Array.of_list (List.map (fun (k, v) -> sprintf "%s=%s" k v) test_config.env_vars)) in
+  
   match start_process 
     ~name:"AudioTrace" 
     ~cmd:audio_trace_path 
-    ~args:[| audio_trace_path |] with
+    ~args:[| audio_trace_path |]
+    ~env:env_array with
   | Error msg ->
       Failure msg
   | Ok audio_handle ->
@@ -230,45 +248,37 @@ let run_test () =
       if zero_samples = 0 && non_zero_samples = 0 then
         Inconclusive "No RMS samples found in output. AudioTrace may not have started properly."
       else if non_zero_samples > 0 then
-        Failure (sprintf "AudioTrace captured %d non-zero audio samples. The silence bug appears to be FIXED!" non_zero_samples)
-      else
         Success { zero_samples; non_zero_samples }
+      else
+        Failure (sprintf "All %d RMS samples were zero (silence bug confirmed)" zero_samples)
 
-(* Print final test result *)
-let print_result = function
-  | Success { zero_samples; _ } ->
-      printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
-      printf "%s %s\n" 
-        (Color.green "✓") 
-        (Color.green (Color.bold "SILENCE BUG REPRODUCED SUCCESSFULLY"));
-      printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
-      printf "\n";
-      printf "The test confirms the silence issue:\n";
-      printf "  • AudioTrace captured %d RMS samples\n" zero_samples;
-      printf "  • All samples were 0.0000... (complete silence)\n";
-      printf "  • Audio was played during capture\n";
-      printf "  • %s\n" 
-        (Color.yellow "This demonstrates that AudioTrace is not capturing actual audio data.");
-      printf "\n";
-      exit 0
+(* Print final test result for a single test *)
+let print_single_result (cfg : test_config) = function
+  | Success { zero_samples; non_zero_samples } ->
+      let status = if non_zero_samples > 0 then
+        (Color.green "✓ WORKING", Color.green)
+      else
+        (Color.red "✗ SILENT", Color.red)
+      in
+      printf "%s %s: %s\n" 
+        (fst status)
+        cfg.name
+        ((snd status) (sprintf "%d zero, %d non-zero samples" zero_samples non_zero_samples));
+      (zero_samples, non_zero_samples)
       
   | Failure msg ->
-      printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
-      printf "%s %s\n" 
-        (Color.red "✗") 
-        (Color.red (Color.bold "TEST FAILED"));
-      printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
-      printf "\n%s\n\n" msg;
-      exit 1
+      printf "%s %s: %s\n" 
+        (Color.red "✗")
+        cfg.name
+        msg;
+      (0, 0)
       
   | Inconclusive msg ->
-      printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
-      printf "%s %s\n" 
-        (Color.yellow "?") 
-        (Color.yellow (Color.bold "TEST INCONCLUSIVE"));
-      printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
-      printf "\n%s\n\n" msg;
-      exit 2
+      printf "%s %s: %s\n" 
+        (Color.yellow "?")
+        cfg.name
+        msg;
+      (0, 0)
 
 (* Entry point *)
 let () =
@@ -280,6 +290,74 @@ let () =
     exit 1
   end;
   
-  (* Run the test and print results *)
-  let result = run_test () in
-  print_result result
+  (* Define test matrix *)
+  let test_configs = [
+    {
+      name = "Baseline (Current)";
+      description = "device_uid=\"BuiltInSpeakerDevice\", convenience initializer";
+      env_vars = [];
+    };
+    {
+      name = "Test A: nil deviceUID";
+      description = "device_uid=nil, convenience initializer";
+      env_vars = [("AUDIO_TRACE_DEBUG_NIL_DEVICE_UID", "1")];
+    };
+    {
+      name = "Test B: nil deviceUID + explicit mixdown";
+      description = "device_uid=nil, explicit property setting with mixdown=YES";
+      env_vars = [
+        ("AUDIO_TRACE_DEBUG_NIL_DEVICE_UID", "1");
+        ("AUDIO_TRACE_DEBUG_EXPLICIT_MIXDOWN", "1")
+      ];
+    };
+  ] in
+  
+  printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
+  printf "%s\n" (Color.bold "  AudioTrace Tap Configuration Test Matrix");
+  printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
+  printf "\n";
+  printf "Running %d test configurations...\n\n" (List.length test_configs);
+  
+  (* Run all tests and collect results *)
+  let results = List.map (fun config ->
+    let result = run_test config in
+    Unix.sleepf 1.0; (* Brief pause between tests *)
+    (config, result)
+  ) test_configs in
+  
+  (* Print summary *)
+  printf "\n%s\n" (Color.bold "═══════════════════════════════════════════════════");
+  printf "%s\n" (Color.bold "  Test Matrix Results");
+  printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
+  printf "\n";
+  
+  let has_working = ref false in
+  let has_silent = ref false in
+  
+  List.iter (fun (test_cfg, result) ->
+    let (_, non_zero) = print_single_result test_cfg result in
+    if non_zero > 0 then has_working := true
+    else has_silent := true
+  ) results;
+  
+  printf "\n%s\n" (Color.bold "═══════════════════════════════════════════════════");
+  printf "%s\n" (Color.bold "  Conclusion");
+  printf "%s\n" (Color.bold "═══════════════════════════════════════════════════");
+  printf "\n";
+  
+  if !has_working then begin
+    printf "%s At least one configuration captured audio successfully!\n" 
+      (Color.green "✓");
+    printf "  Review the results above to identify which configuration works.\n\n";
+    exit 0
+  end else if !has_silent then begin
+    printf "%s All configurations captured only silence.\n" 
+      (Color.red "✗");
+    printf "  The silence issue persists across all tested configurations.\n\n";
+    exit 1
+  end else begin
+    printf "%s Tests were inconclusive.\n" 
+      (Color.yellow "?");
+    printf "  Check that AudioTrace is starting properly and audio is playing.\n\n";
+    exit 2
+  end

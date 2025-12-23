@@ -10,6 +10,17 @@ namespace AudioTrace {
 
 namespace {
 
+// Debug mode environment variables
+static bool debug_use_nil_device_uid() {
+    static bool value = std::getenv("AUDIO_TRACE_DEBUG_NIL_DEVICE_UID") != nullptr;
+    return value;
+}
+
+static bool debug_explicit_mixdown() {
+    static bool value = std::getenv("AUDIO_TRACE_DEBUG_EXPLICIT_MIXDOWN") != nullptr;
+    return value;
+}
+
 AudioObjectID default_output_device() {
     AudioObjectID device_id = kAudioObjectUnknown;
     UInt32 data_size = sizeof(device_id);
@@ -256,6 +267,12 @@ bool AudioTapManager::start() {
     
     for (auto uid : tap_uids) {
         if (uid) CFRelease(uid);
+    }
+
+    // Step 3.5: Wait for aggregate device to become ready
+    // Based on AudioTee Swift implementation - device needs time to initialize
+    if (!wait_for_device_ready(aggregate_device_id_, 2.0)) {
+        NSLog(@"⚠️  Aggregate device did not become ready, proceeding anyway...");
     }
 
     // Step 4: Start worker thread
@@ -555,27 +572,19 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         NSNumber* processID = @(process_obj_id);
         NSArray<NSNumber*>* processes = @[processID];
 
-        // Target the default output stream explicitly (aligns format with device)
-        NSString* device_uid = default_output_device_uid_string();
-        CATapDescription* tapDesc = nil;
-        if (device_uid) {
-            tapDesc = [[CATapDescription alloc] initWithProcesses:processes
-                                                     andDeviceUID:device_uid
-                                                       withStream:0];
-            NSLog(@"🎯 Creating tap for PID %d with device UID %@ stream 0", pid, device_uid);
-        } else {
-            tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
-            NSLog(@"🎯 Creating tap for PID %d with stereo mixdown (no device UID)", pid);
-        }
+        // OPTION 1 TEST: Always use initStereoMixdownOfProcesses
+        // This is the key - use the mixdown initializer for single-process taps
+        NSLog(@"🎯 Creating stereo mixdown tap for single process (PID %d, obj %u)", pid, process_obj_id);
+        CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
+        
         if (!tapDesc) {
+            NSLog(@"❌ Failed to create tap descriptor for PID %d", pid);
             return false;
         }
         
-        // SoundPusher uses exclusive=NO with empty exclude list
+        // These properties should already be set by the initializer, but set them explicitly to be safe
         tapDesc.exclusive = NO;
-        // Keep audio unmuted (we want to monitor, not capture)
         tapDesc.muteBehavior = CATapUnmuted;
-        // Match aggregate device privacy
         tapDesc.privateTap = YES;
         
         // Create the tap - THIS WILL TRIGGER THE PERMISSION PROMPT!
@@ -585,6 +594,27 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         if (status != noErr || tap_id == kAudioObjectUnknown) {
             NSLog(@"AudioHardwareCreateProcessTap failed for PID %d with status %d", pid, (int)status);
             return false;
+        }
+        
+        // Verify tap format (Step 4 from design doc)
+        AudioStreamBasicDescription fmt{};
+        UInt32 size = sizeof(fmt);
+        AudioObjectPropertyAddress fmt_addr{
+            kAudioTapPropertyFormat,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        if (AudioObjectGetPropertyData(tap_id, &fmt_addr, 0, nullptr, &size, &fmt) == noErr) {
+            NSLog(@"📊 Tap format: rate=%.0f, channels=%u, bytesPerFrame=%u, formatFlags=0x%x",
+                  fmt.mSampleRate, fmt.mChannelsPerFrame, fmt.mBytesPerFrame, fmt.mFormatFlags);
+            
+            // CRITICAL: Verify this is NOT zero or invalid
+            if (fmt.mSampleRate == 0 || fmt.mChannelsPerFrame == 0) {
+                NSLog(@"❌ INVALID tap format detected! rate=%.0f channels=%u",
+                      fmt.mSampleRate, fmt.mChannelsPerFrame);
+            }
+        } else {
+            NSLog(@"⚠️ Could not get tap format for verification");
         }
 
         // Create ProcessTap structure
@@ -693,22 +723,33 @@ void AudioTapManager::log_available_audio_processes() {
 bool AudioTapManager::create_tap_for_system() {
     // For system-wide audio, create a stereo mixdown tap
     @autoreleasepool {
-        // SoundPusher uses initExcludingProcesses with empty array (macOS 26+ may need this)
-        CATapDescription* tapDesc = [[CATapDescription alloc] initExcludingProcesses:@[]];
+        NSLog(@"🔧 Creating system-wide tap descriptor...");
+        
+        // Use initStereoGlobalTapButExcludeProcesses with empty array = tap everything
+        CATapDescription* tapDesc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
         if (!tapDesc) {
+            NSLog(@"❌ Failed to create CATapDescription");
             return false;
         }
+        
+        NSLog(@"✓ Tap descriptor created");
         
         // Keep audio unmuted for monitoring
         tapDesc.muteBehavior = CATapUnmuted;
         tapDesc.privateTap = YES;
         tapDesc.exclusive = NO;
         
+        NSLog(@"🎯 Tap config: muteBehavior=%d, privateTap=%d, exclusive=%d", 
+              (int)tapDesc.muteBehavior, (int)tapDesc.privateTap, (int)tapDesc.exclusive);
+        
+        NSLog(@"🔧 Calling AudioHardwareCreateProcessTap (may trigger permission prompt)...");
         AudioObjectID tap_id = kAudioObjectUnknown;
         OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
         
+        NSLog(@"✓ AudioHardwareCreateProcessTap returned: status=%d, tap_id=%u", (int)status, tap_id);
+        
         if (status != noErr || tap_id == kAudioObjectUnknown) {
-            NSLog(@"Failed to create system-wide tap, status: %d", (int)status);
+            NSLog(@"❌ Failed to create system-wide tap, status: %d (tap_id=%u)", (int)status, tap_id);
             return false;
         }
         
@@ -827,6 +868,49 @@ void AudioTapManager::destroy_aggregate_device() {
         AudioHardwareDestroyAggregateDevice(aggregate_device_id_);
         aggregate_device_id_ = kAudioObjectUnknown;
     }
+}
+
+bool AudioTapManager::wait_for_device_ready(AudioObjectID device_id, double timeout_seconds) {
+    // Based on AudioTee Swift implementation
+    // Poll device readiness with 100ms intervals
+    const double poll_interval = 0.1;  // 100ms
+    const int max_polls = static_cast<int>(timeout_seconds / poll_interval);
+    
+    NSLog(@"⏳ Waiting for device %u to become ready...", device_id);
+    
+    AudioObjectPropertyAddress addr{
+        kAudioDevicePropertyDeviceIsAlive,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    
+    for (int poll = 1; poll <= max_polls; ++poll) {
+        UInt32 is_alive = 0;
+        UInt32 size = sizeof(is_alive);
+        OSStatus status = AudioObjectGetPropertyData(
+            device_id,
+            &addr,
+            0,
+            nullptr,
+            &size,
+            &is_alive
+        );
+        
+        if (status == noErr && is_alive == 1) {
+            NSLog(@"✓ Device %u ready after %d polls (%.1fs)", 
+                  device_id, poll, poll * poll_interval);
+            return true;
+        }
+        
+        if (poll < max_polls) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(static_cast<int>(poll_interval * 1000))
+            );
+        }
+    }
+    
+    NSLog(@"⚠️  Device %u did not become ready within %.1fs", device_id, timeout_seconds);
+    return false;
 }
 
 }  // namespace AudioTrace

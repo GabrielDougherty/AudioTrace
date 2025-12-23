@@ -1,9 +1,11 @@
 (library
  (name audio_generator)
  (modules audio_generator)
- (libraries unix))
+ (libraries unix)
+ (flags (:standard -cclib -L/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib)))
 
 (executable
  (name test_silence_issue)
  (modules test_silence_issue)
- (libraries unix str audio_generator))
+ (libraries unix str audio_generator)
+ (flags (:standard -cclib -L/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib)))

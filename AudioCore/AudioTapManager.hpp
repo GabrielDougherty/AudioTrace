@@ -104,6 +104,7 @@ private:
     // Helper methods
     bool create_aggregate_device(const std::vector<CFStringRef>& tap_uids);
     void destroy_aggregate_device();
+    bool wait_for_device_ready(AudioObjectID device_id, double timeout_seconds);
     bool create_tap_for_process(pid_t pid);
     bool create_tap_for_system();
     std::vector<AudioObjectID> discover_audio_processes();
