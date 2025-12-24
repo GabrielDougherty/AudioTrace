@@ -7,7 +7,7 @@ namespace AudioTrace {
     class AudioTapManager;
 }
 
-@interface StatusItem : NSObject
+@interface StatusItem : NSObject <NSMenuDelegate>
 
 - (instancetype)initWithTapManager:(AudioTrace::AudioTapManager*)tapManager;
 - (void)show;

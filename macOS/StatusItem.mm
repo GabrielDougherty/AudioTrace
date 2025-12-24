@@ -6,7 +6,6 @@
 @interface StatusItem ()
 @property (strong, nonatomic) NSStatusItem* statusItem;
 @property (strong, nonatomic) NSMenu* menu;
-@property (strong, nonatomic) NSTimer* updateTimer;
 @property (assign, nonatomic) AudioTrace::AudioTapManager* tapManager;
 @end
 
@@ -18,6 +17,7 @@
         _tapManager = tapManager;
         _menu = [[NSMenu alloc] init];
         _menu.autoenablesItems = NO;
+        _menu.delegate = self;
     }
     return self;
 }
@@ -27,14 +27,6 @@
         self.statusItem = [[NSStatusBar systemStatusBar] statusItemWithLength:NSVariableStatusItemLength];
         self.statusItem.button.title = @"🔊";
         self.statusItem.menu = self.menu;
-        
-        // Update menu every 500ms
-        self.updateTimer = [NSTimer scheduledTimerWithTimeInterval:0.5
-                                                           target:self
-                                                         selector:@selector(updateMenu)
-                                                         userInfo:nil
-                                                          repeats:YES];
-        
         [self updateMenu];
     }
 }
@@ -43,11 +35,6 @@
     if (self.statusItem) {
         [[NSStatusBar systemStatusBar] removeStatusItem:self.statusItem];
         self.statusItem = nil;
-    }
-    
-    if (self.updateTimer) {
-        [self.updateTimer invalidate];
-        self.updateTimer = nil;
     }
 }
 
@@ -116,6 +103,12 @@
                                                keyEquivalent:@"q"];
     quitItem.target = NSApp;
     [self.menu addItem:quitItem];
+}
+
+#pragma mark - NSMenuDelegate
+
+- (void)menuWillOpen:(NSMenu *)menu {
+    [self updateMenu];
 }
 
 - (void)dealloc {
