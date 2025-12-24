@@ -16,6 +16,9 @@
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     AudioTrace::Logger::info("AudioTrace starting...");
 
+    // Request accessibility permissions for window title reading
+    [self checkAccessibilityPermissions];
+
     // Initialize audio capture
     [self setupAudioPipeline];
 
@@ -24,6 +27,18 @@
     [self.statusItem show];
 
     AudioTrace::Logger::info("AudioTrace menu bar app ready");
+}
+
+- (void)checkAccessibilityPermissions {
+    NSDictionary *options = @{(__bridge id)kAXTrustedCheckOptionPrompt: @YES};
+    BOOL accessibilityEnabled = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
+    
+    if (!accessibilityEnabled) {
+        AudioTrace::Logger::warn("Accessibility permissions not granted - window titles will not be available");
+        AudioTrace::Logger::warn("Please grant access in System Settings > Privacy & Security > Accessibility");
+    } else {
+        AudioTrace::Logger::info("Accessibility permissions granted");
+    }
 }
 
 - (void)setupAudioPipeline {

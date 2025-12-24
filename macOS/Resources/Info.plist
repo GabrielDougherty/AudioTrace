@@ -42,6 +42,10 @@
     <key>NSAudioCaptureUsageDescription</key>
     <string>AudioTrace monitors which applications are producing sound to display activity in the menu bar. No audio data is recorded or stored.</string>
     
+    <!-- Accessibility permission (required for reading window titles) -->
+    <key>NSAppleEventsUsageDescription</key>
+    <string>AudioTrace needs accessibility access to read window titles from applications that are producing audio.</string>
+    
     <!-- Application doesn't appear in Dock -->
     <key>LSBackgroundOnly</key>
     <false/>
