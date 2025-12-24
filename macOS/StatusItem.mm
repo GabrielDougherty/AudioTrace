@@ -132,6 +132,7 @@
 
 - (void)dealloc {
     [self hide];
+    [super dealloc];
 }
 
 @end
