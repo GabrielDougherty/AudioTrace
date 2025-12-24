@@ -4,6 +4,7 @@
 #include "../AudioCore/AudioTapManager.hpp"
 #include "../AudioCore/AudioAnalyzer.hpp"
 #include "../AudioCore/ActivityTracker.hpp"
+#include "../AudioCore/Logger.hpp"
 
 @interface AppDelegate () {
     std::unique_ptr<AudioTrace::AudioTapManager> _tapManager;
@@ -13,7 +14,7 @@
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    NSLog(@"AudioTrace starting...");
+    AudioTrace::Logger::info("AudioTrace starting...");
 
     // Initialize audio capture
     [self setupAudioPipeline];
@@ -22,7 +23,7 @@
     self.statusItem = [[StatusItem alloc] initWithTapManager:_tapManager.get()];
     [self.statusItem show];
 
-    NSLog(@"AudioTrace menu bar app ready");
+    AudioTrace::Logger::info("AudioTrace menu bar app ready");
 }
 
 - (void)setupAudioPipeline {
@@ -35,15 +36,15 @@
     // Start audio capture - will trigger permission prompt if needed
     bool started = _tapManager->start();
     if (!started) {
-        NSLog(@"⚠️  Failed to start audio tap manager");
-        NSLog(@"Check System Settings > Privacy & Security > Screen Recording");
+        AudioTrace::Logger::warn("Failed to start audio tap manager");
+        AudioTrace::Logger::warn("Check System Settings > Privacy & Security > Screen Recording");
     } else {
-        NSLog(@"✓ Audio tap manager started successfully");
+        AudioTrace::Logger::info("Audio tap manager started successfully");
     }
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
-    NSLog(@"AudioTrace shutting down...");
+    AudioTrace::Logger::info("AudioTrace shutting down...");
     
     // Stop audio capture
     if (_tapManager) {

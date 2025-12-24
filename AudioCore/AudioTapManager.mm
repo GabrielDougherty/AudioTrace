@@ -1,4 +1,5 @@
 #include "AudioTapManager.hpp"
+#include "Logger.hpp"
 #include <thread>
 #include <algorithm>
 #include <unordered_set>
@@ -40,7 +41,7 @@ AudioObjectID default_output_device() {
     );
 
     if (status != noErr) {
-        NSLog(@"⚠️ Failed to query default output device: %d", (int)status);
+        Logger::warn("Failed to query default output device: {}", (int)status);
         return kAudioObjectUnknown;
     }
     return device_id;
@@ -61,14 +62,14 @@ void log_default_output_format() {
     UInt32 data_size = 0;
     if (AudioObjectGetPropertyDataSize(device, &cfg_addr, 0, nullptr, &data_size) != noErr ||
         data_size == 0) {
-        NSLog(@"⚠️ Failed to query output stream configuration");
+        Logger::warn("Failed to query output stream configuration");
         return;
     }
 
     std::vector<uint8_t> buffer(data_size);
     auto* buf_list = reinterpret_cast<AudioBufferList*>(buffer.data());
     if (AudioObjectGetPropertyData(device, &cfg_addr, 0, nullptr, &data_size, buf_list) != noErr) {
-        NSLog(@"⚠️ Failed to read output stream configuration");
+        Logger::warn("Failed to read output stream configuration");
         return;
     }
 
@@ -86,11 +87,11 @@ void log_default_output_format() {
         kAudioObjectPropertyElementMain
     };
     if (AudioObjectGetPropertyData(device, &rate_addr, 0, nullptr, &data_size, &sample_rate) != noErr) {
-        NSLog(@"⚠️ Failed to read output sample rate");
+        Logger::warn("Failed to read output sample rate");
         return;
     }
 
-    NSLog(@"ℹ️ Default output device %u: sample_rate=%.1f Hz, channels=%u (buffers=%u)",
+    Logger::info("Default output device {}: sample_rate={:.1f} Hz, channels={} (buffers={})",
           device, sample_rate, channels, buf_list->mNumberBuffers);
 }
 
@@ -104,7 +105,7 @@ void log_tap_format(AudioObjectID tap_id, pid_t pid) {
     };
 
     if (AudioObjectGetPropertyData(tap_id, &addr, 0, nullptr, &size, &fmt) == noErr) {
-        NSLog(@"ℹ️ Tap %u (PID %d) format: %.1f Hz, channels=%u, bytes/frame=%u, flags=0x%08x",
+        Logger::info("Tap {} (PID {}) format: {:.1f} Hz, channels={}, bytes/frame={}, flags=0x{:08x}",
               tap_id,
               pid,
               fmt.mSampleRate,
@@ -112,7 +113,7 @@ void log_tap_format(AudioObjectID tap_id, pid_t pid) {
               fmt.mBytesPerFrame,
               (unsigned int)fmt.mFormatFlags);
     } else {
-        NSLog(@"⚠️ Failed to read format for tap %u (PID %d)", tap_id, pid);
+        Logger::warn("Failed to read format for tap {} (PID {})", tap_id, pid);
     }
 }
 
@@ -131,7 +132,7 @@ NSString* default_output_device_uid_string() {
     };
     
     if (AudioObjectGetPropertyData(device, &addr, 0, nullptr, &data_size, &uid_string) != noErr || !uid_string) {
-        NSLog(@"⚠️ Failed to read UID for default output device %u", device);
+        Logger::warn("Failed to read UID for default output device {}", device);
         return nil;
     }
     NSString* ns = [NSString stringWithString:(__bridge NSString*)uid_string];
@@ -173,13 +174,13 @@ bool AudioTapManager::start() {
     }
 
     if (debug_log_buffers_) {
-        NSLog(@"🛠️  Debug logging for buffers is enabled (AUDIO_TRACE_DEBUG_LOG_BUFFERS=1)");
+        Logger::debug("Debug logging for buffers is enabled (AUDIO_TRACE_DEBUG_LOG_BUFFERS=1)");
     }
     if (debug_global_only_) {
-        NSLog(@"🛠️  Debug mode: using ONLY global tap (AUDIO_TRACE_DEBUG_GLOBAL_ONLY=1)");
+        Logger::debug("Debug mode: using ONLY global tap (AUDIO_TRACE_DEBUG_GLOBAL_ONLY=1)");
     }
     if (debug_single_pid_ > 0) {
-        NSLog(@"🛠️  Debug mode: single PID tap = %d (AUDIO_TRACE_DEBUG_SINGLE_PID)", debug_single_pid_);
+        Logger::debug("Debug mode: single PID tap = {} (AUDIO_TRACE_DEBUG_SINGLE_PID)", debug_single_pid_);
     }
 
     log_default_output_format();
@@ -192,13 +193,13 @@ bool AudioTapManager::start() {
 
     if (debug_single_pid_ > 0) {
         if (!create_tap_for_process(debug_single_pid_)) {
-            NSLog(@"Failed to create tap for debug PID %d", debug_single_pid_);
+            Logger::error("Failed to create tap for debug PID {}", debug_single_pid_);
             return false;
         }
     } else if (debug_global_only_) {
-        NSLog(@"No audio processes found - creating tap for system audio");
+        Logger::info("No audio processes found - creating tap for system audio");
         if (!create_tap_for_system()) {
-            NSLog(@"Failed to create system audio tap");
+            Logger::error("Failed to create system audio tap");
             return false;
         }
     } else {
@@ -212,14 +213,14 @@ bool AudioTapManager::start() {
             pid_t pid = get_pid_from_audio_object(obj_id);
             if (pid > 0 && !seen.count(pid)) {
                 seen.insert(pid);
-                NSLog(@"Creating tap for PID %d", pid);
+                Logger::info("Creating tap for PID {}", pid);
                 create_tap_for_process(pid);
             }
         }
     }
     
     if (process_taps_.empty() && !debug_global_only_ && debug_single_pid_ <= 0) {
-        NSLog(@"Failed to create any process taps, falling back to system audio");
+        Logger::warn("Failed to create any process taps, falling back to system audio");
         if (!create_tap_for_system()) {
             return false;
         }
@@ -227,7 +228,7 @@ bool AudioTapManager::start() {
 
     if (debug_log_buffers_) {
         for (size_t i = 0; i < process_taps_.size(); ++i) {
-            NSLog(@"🔎 Tap map: buffer index %zu -> PID %d (tap %u)",
+            Logger::debug("Tap map: buffer index {} -> PID {} (tap {})",
                   i, process_taps_[i]->pid, process_taps_[i]->tap_id);
         }
     }
@@ -272,7 +273,7 @@ bool AudioTapManager::start() {
     // Step 3.5: Wait for aggregate device to become ready
     // Based on AudioTee Swift implementation - device needs time to initialize
     if (!wait_for_device_ready(aggregate_device_id_, 2.0)) {
-        NSLog(@"⚠️  Aggregate device did not become ready, proceeding anyway...");
+        Logger::warn("Aggregate device did not become ready, proceeding anyway...");
     }
 
     // Step 4: Start worker thread
@@ -290,7 +291,7 @@ bool AudioTapManager::start() {
     );
     
     if (status != noErr) {
-        NSLog(@"❌ Failed to create IOProcID: %d", status);
+        Logger::error("Failed to create IOProcID: {}", status);
         stop();
         return false;
     }
@@ -298,14 +299,14 @@ bool AudioTapManager::start() {
     // Step 6: Start the aggregate device
     status = AudioDeviceStart(aggregate_device_id_, io_proc_id_);
     if (status != noErr) {
-        NSLog(@"❌ Failed to start aggregate device: %d", status);
+        Logger::error("Failed to start aggregate device: {}", status);
         AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
         io_proc_id_ = nullptr;
         stop();
         return false;
     }
 
-    NSLog(@"🎉 Started aggregate device with %zu taps", process_taps_.size());
+    Logger::info("Started aggregate device with {} taps", process_taps_.size());
     is_running_ = true;
     return true;
 }
@@ -357,7 +358,7 @@ std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
 }
 
 void AudioTapManager::worker_thread_proc() {
-    NSLog(@"🧵 Worker thread started, taps=%zu", process_taps_.size());
+    Logger::debug("Worker thread started, taps={}", process_taps_.size());
     int loop_count = 0;
     int total_pops = 0;
     int samples_checked = 0;
@@ -381,7 +382,7 @@ void AudioTapManager::worker_thread_proc() {
                 float rms = std::sqrt(sum / (data.frame_count * data.channel_count));
                 
                 if (samples_checked % 1000 == 0) {
-                    NSLog(@"🔍 Sample %d: PID %d, RMS=%.9f (threshold=0.005)", 
+                    Logger::trace("Sample {}: PID {}, RMS={:.9f} (threshold=0.005)", 
                           samples_checked, data.pid, rms);
                 }
                 
@@ -398,7 +399,7 @@ void AudioTapManager::worker_thread_proc() {
                     // Record activity
                     tracker_.record_activity(*event);
                     
-                    NSLog(@"🎵 Activity! PID %d, RMS: %.6f", data.pid, event->rms_level);
+                    Logger::trace("Activity! PID {}, RMS: {:.6f}", data.pid, event->rms_level);
                     
                     // Also call user callback if set
                     if (audio_callback_) {
@@ -411,7 +412,7 @@ void AudioTapManager::worker_thread_proc() {
         }
         
         if (pops_this_loop > 0 && loop_count % 50 == 0) {
-            NSLog(@"📦 Loop %d: popped %d buffers (total=%d)", loop_count, pops_this_loop, total_pops);
+            Logger::trace("Loop {}: popped {} buffers (total={})", loop_count, pops_this_loop, total_pops);
         }
         
         loop_count++;
@@ -447,18 +448,18 @@ OSStatus AudioTapManager::audio_io_proc(
     static std::atomic<int> callback_count{0};
     int count = ++callback_count;
     if (count % 1000 == 0) {
-        NSLog(@"🎤 Audio callback fired %d times, %u buffers", 
+        Logger::trace("Audio callback fired {} times, {} buffers", 
               count, inInputData->mNumberBuffers);
         
         // Debug: Check first buffer's data
         if (inInputData->mNumberBuffers > 0) {
             const AudioBuffer& buf = inInputData->mBuffers[0];
-            NSLog(@"  Buffer 0: channels=%u, dataSize=%u bytes", 
+            Logger::trace("  Buffer 0: channels={}, dataSize={} bytes", 
                   buf.mNumberChannels, buf.mDataByteSize);
             
             if (buf.mData && buf.mDataByteSize >= sizeof(float) * 4) {
                 const float* samples = static_cast<const float*>(buf.mData);
-                NSLog(@"  First samples: %.6f, %.6f, %.6f, %.6f", 
+                Logger::trace("  First samples: {:.6f}, {:.6f}, {:.6f}, {:.6f}", 
                       samples[0], samples[1], samples[2], samples[3]);
             }
         }
@@ -470,13 +471,13 @@ OSStatus AudioTapManager::audio_io_proc(
             const AudioBuffer& buf = inInputData->mBuffers[i];
             if (buf.mData && buf.mDataByteSize >= sizeof(float) * 4) {
                 const float* samples = static_cast<const float*>(buf.mData);
-                NSLog(@"  [buf %u] ch=%u size=%u first4=%.6f, %.6f, %.6f, %.6f",
+                Logger::trace("  [buf {}] ch={} size={} first4={:.6f}, {:.6f}, {:.6f}, {:.6f}",
                       (unsigned)i,
                       buf.mNumberChannels,
                       buf.mDataByteSize,
                       samples[0], samples[1], samples[2], samples[3]);
             } else {
-                NSLog(@"  [buf %u] ch=%u size=%u (no data)", (unsigned)i, buf.mNumberChannels, buf.mDataByteSize);
+                Logger::trace("  [buf {}] ch={} size={} (no data)", (unsigned)i, buf.mNumberChannels, buf.mDataByteSize);
             }
         }
     }
@@ -501,7 +502,7 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
 
     static int map_log_counter = 0;
     if (debug_log_buffers_ && map_log_counter < 5) {
-        NSLog(@"🔗 Mapping %u buffers to %zu taps", num_buffers, process_taps_.size());
+        Logger::trace("Mapping {} buffers to {} taps", num_buffers, process_taps_.size());
     }
     
     for (uint32_t i = 0; i < num_buffers; ++i) {
@@ -521,7 +522,7 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
 
         if (debug_log_buffers_ && map_log_counter < 5) {
             float first = (buffer.mDataByteSize >= sizeof(float)) ? samples[0] : 0.0f;
-            NSLog(@"    [map] buf %u -> PID %d, ch=%u frames=%u first=%.6f",
+            Logger::trace("    [map] buf {} -> PID {}, ch={} frames={} first={:.6f}",
                   i, tap->pid, channel_count, frame_count, first);
         }
         
@@ -538,7 +539,7 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         if (!tap->ring_buffer.push(data)) {
             static std::atomic<int> drop_count{0};
             if (++drop_count % 100 == 0) {
-                NSLog(@"⚠️ Dropped %d buffers (ring buffer full)", drop_count.load());
+                Logger::warn("Dropped {} buffers (ring buffer full)", drop_count.load());
             }
         }
     }
@@ -564,7 +565,7 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
     @autoreleasepool {
         AudioObjectID process_obj_id = find_process_object_for_pid(pid);
         if (process_obj_id == kAudioObjectUnknown) {
-            NSLog(@"Failed to find audio process object for PID %d", pid);
+            Logger::error("Failed to find audio process object for PID {}", pid);
             return false;
         }
         
@@ -574,11 +575,11 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
 
         // OPTION 1 TEST: Always use initStereoMixdownOfProcesses
         // This is the key - use the mixdown initializer for single-process taps
-        NSLog(@"🎯 Creating stereo mixdown tap for single process (PID %d, obj %u)", pid, process_obj_id);
+        Logger::debug("Creating stereo mixdown tap for single process (PID {}, obj {})", pid, process_obj_id);
         CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
         
         if (!tapDesc) {
-            NSLog(@"❌ Failed to create tap descriptor for PID %d", pid);
+            Logger::error("Failed to create tap descriptor for PID {}", pid);
             return false;
         }
         
@@ -592,7 +593,7 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
         
         if (status != noErr || tap_id == kAudioObjectUnknown) {
-            NSLog(@"AudioHardwareCreateProcessTap failed for PID %d with status %d", pid, (int)status);
+            Logger::error("AudioHardwareCreateProcessTap failed for PID {} with status {}", pid, (int)status);
             return false;
         }
         
@@ -605,16 +606,16 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
             kAudioObjectPropertyElementMain
         };
         if (AudioObjectGetPropertyData(tap_id, &fmt_addr, 0, nullptr, &size, &fmt) == noErr) {
-            NSLog(@"📊 Tap format: rate=%.0f, channels=%u, bytesPerFrame=%u, formatFlags=0x%x",
+            Logger::debug("Tap format: rate={:.0f}, channels={}, bytesPerFrame={}, formatFlags=0x{:x}",
                   fmt.mSampleRate, fmt.mChannelsPerFrame, fmt.mBytesPerFrame, fmt.mFormatFlags);
             
             // CRITICAL: Verify this is NOT zero or invalid
             if (fmt.mSampleRate == 0 || fmt.mChannelsPerFrame == 0) {
-                NSLog(@"❌ INVALID tap format detected! rate=%.0f channels=%u",
+                Logger::error("INVALID tap format detected! rate={:.0f} channels={}",
                       fmt.mSampleRate, fmt.mChannelsPerFrame);
             }
         } else {
-            NSLog(@"⚠️ Could not get tap format for verification");
+            Logger::warn("Could not get tap format for verification");
         }
 
         // Create ProcessTap structure
@@ -627,7 +628,7 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         );
         
         process_taps_.push_back(std::move(process_tap));
-        NSLog(@"✓ Created tap %u for PID %d", tap_id, pid);
+        Logger::info("Created tap {} for PID {}", tap_id, pid);
         log_tap_format(tap_id, pid);
         return true;
     }
@@ -709,47 +710,47 @@ AudioObjectID AudioTapManager::find_process_object_for_pid(pid_t pid) {
 void AudioTapManager::log_available_audio_processes() {
     auto process_objects = discover_audio_processes();
     if (process_objects.empty()) {
-        NSLog(@"ℹ️ No audio process objects found");
+        Logger::info("No audio process objects found");
         return;
     }
 
-    NSLog(@"ℹ️ Audio process objects:");
+    Logger::info("Audio process objects:");
     for (AudioObjectID obj_id : process_objects) {
         pid_t pid = get_pid_from_audio_object(obj_id);
-        NSLog(@"    - obj=%u pid=%d", obj_id, pid);
+        Logger::info("    - obj={} pid={}", obj_id, pid);
     }
 }
 
 bool AudioTapManager::create_tap_for_system() {
     // For system-wide audio, create a stereo mixdown tap
     @autoreleasepool {
-        NSLog(@"🔧 Creating system-wide tap descriptor...");
+        Logger::debug("Creating system-wide tap descriptor...");
         
         // Use initStereoGlobalTapButExcludeProcesses with empty array = tap everything
         CATapDescription* tapDesc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
         if (!tapDesc) {
-            NSLog(@"❌ Failed to create CATapDescription");
+            Logger::error("Failed to create CATapDescription");
             return false;
         }
         
-        NSLog(@"✓ Tap descriptor created");
+        Logger::debug("Tap descriptor created");
         
         // Keep audio unmuted for monitoring
         tapDesc.muteBehavior = CATapUnmuted;
         tapDesc.privateTap = YES;
         tapDesc.exclusive = NO;
         
-        NSLog(@"🎯 Tap config: muteBehavior=%d, privateTap=%d, exclusive=%d", 
+        Logger::debug("Tap config: muteBehavior={}, privateTap={}, exclusive={}", 
               (int)tapDesc.muteBehavior, (int)tapDesc.privateTap, (int)tapDesc.exclusive);
         
-        NSLog(@"🔧 Calling AudioHardwareCreateProcessTap (may trigger permission prompt)...");
+        Logger::debug("Calling AudioHardwareCreateProcessTap (may trigger permission prompt)...");
         AudioObjectID tap_id = kAudioObjectUnknown;
         OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
         
-        NSLog(@"✓ AudioHardwareCreateProcessTap returned: status=%d, tap_id=%u", (int)status, tap_id);
+        Logger::debug("AudioHardwareCreateProcessTap returned: status={}, tap_id={}", (int)status, tap_id);
         
         if (status != noErr || tap_id == kAudioObjectUnknown) {
-            NSLog(@"❌ Failed to create system-wide tap, status: %d (tap_id=%u)", (int)status, tap_id);
+            Logger::error("Failed to create system-wide tap, status: {} (tap_id={})", (int)status, tap_id);
             return false;
         }
         
@@ -762,7 +763,7 @@ bool AudioTapManager::create_tap_for_system() {
         );
         
         process_taps_.push_back(std::move(process_tap));
-        NSLog(@"✓ Created system-wide audio tap %u", tap_id);
+        Logger::info("Created system-wide audio tap {}", tap_id);
         log_tap_format(tap_id, 0);
         return true;
     }
@@ -845,11 +846,11 @@ bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& ta
     CFRelease(device_dict);
     
     if (status != noErr) {
-        NSLog(@"AudioHardwareCreateAggregateDevice failed with status %d", (int)status);
+        Logger::error("AudioHardwareCreateAggregateDevice failed with status {}", (int)status);
         return false;
     }
     
-    NSLog(@"✅ Created aggregate device %u with %zu taps", aggregate_device_id_, tap_uids.size());
+    Logger::info("Created aggregate device {} with {} taps", aggregate_device_id_, tap_uids.size());
     
     return aggregate_device_id_ != kAudioObjectUnknown;
 }
@@ -876,7 +877,7 @@ bool AudioTapManager::wait_for_device_ready(AudioObjectID device_id, double time
     const double poll_interval = 0.1;  // 100ms
     const int max_polls = static_cast<int>(timeout_seconds / poll_interval);
     
-    NSLog(@"⏳ Waiting for device %u to become ready...", device_id);
+    Logger::debug("Waiting for device {} to become ready...", device_id);
     
     AudioObjectPropertyAddress addr{
         kAudioDevicePropertyDeviceIsAlive,
@@ -897,7 +898,7 @@ bool AudioTapManager::wait_for_device_ready(AudioObjectID device_id, double time
         );
         
         if (status == noErr && is_alive == 1) {
-            NSLog(@"✓ Device %u ready after %d polls (%.1fs)", 
+            Logger::debug("Device {} ready after {} polls ({:.1f}s)", 
                   device_id, poll, poll * poll_interval);
             return true;
         }
@@ -909,7 +910,7 @@ bool AudioTapManager::wait_for_device_ready(AudioObjectID device_id, double time
         }
     }
     
-    NSLog(@"⚠️  Device %u did not become ready within %.1fs", device_id, timeout_seconds);
+    Logger::warn("Device {} did not become ready within {:.1f}s", device_id, timeout_seconds);
     return false;
 }
 

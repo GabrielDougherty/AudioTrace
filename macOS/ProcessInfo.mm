@@ -4,6 +4,7 @@
 #include <libproc.h>
 #include <sys/sysctl.h>
 #include <vector>
+#include "../AudioCore/Logger.hpp"
 
 namespace AudioTrace {
 
@@ -87,7 +88,7 @@ std::optional<std::string> ProcessInfo::get_window_title(pid_t pid) {
             // Use Accessibility API to get window title
             AXUIElementRef app = AXUIElementCreateApplication(try_pid);
             if (!app) {
-                NSLog(@"⚠️ get_window_title: Failed to create AXUIElement for PID %d", try_pid);
+                Logger::debug("Failed to create AXUIElement for PID {}", try_pid);
                 continue;
             }
             
@@ -135,16 +136,16 @@ std::optional<std::string> ProcessInfo::get_window_title(pid_t pid) {
                 if (titleStr.length > 0) {
                     std::string result = [titleStr UTF8String];
                     if (try_pid != pid) {
-                        NSLog(@"✓ get_window_title: Found title '%@' for PID %d via parent %d", titleStr, pid, try_pid);
+                        Logger::debug("Found window title '{}' for PID {} via parent {}", result, pid, try_pid);
                     } else {
-                        NSLog(@"✓ get_window_title: Found title '%@' for PID %d", titleStr, pid);
+                        Logger::debug("Found window title '{}' for PID {}", result, pid);
                     }
                     CFRelease(title);
                     return result;
                 }
                 CFRelease(title);
             } else {
-                NSLog(@"⚠️ get_window_title: No window title found for PID %d", try_pid);
+                Logger::debug("No window title found for PID {}", try_pid);
             }
         }
         

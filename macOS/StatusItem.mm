@@ -1,6 +1,7 @@
 #import "StatusItem.hpp"
 #import "ProcessInfo.hpp"
 #include "../AudioCore/AudioTapManager.hpp"
+#include "../AudioCore/Logger.hpp"
 #include <chrono>
 
 @interface StatusItem ()
@@ -40,7 +41,7 @@
 
 - (void)updateMenu {
     if (!self.tapManager) {
-        NSLog(@"⚠️ updateMenu: tapManager is NULL!");
+        AudioTrace::Logger::warn("updateMenu called but tapManager is NULL");
         return;
     }
 
@@ -49,7 +50,7 @@
     // Get activity snapshot from tap manager
     auto snapshots = self.tapManager->get_activity_snapshot();
     
-    NSLog(@"📊 updateMenu: Got %lu snapshots", (unsigned long)snapshots.size());
+    AudioTrace::Logger::debug("updateMenu: Got {} snapshots", snapshots.size());
 
     if (snapshots.empty()) {
         NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:@"No recent audio activity"
