@@ -159,6 +159,239 @@ AudioTapManager::~AudioTapManager() {
     stop();
 }
 
+OSStatus AudioTapManager::process_list_listener(
+    AudioObjectID inObjectID,
+    UInt32 inNumberAddresses,
+    const AudioObjectPropertyAddress inAddresses[],
+    void* inClientData)
+{
+    auto* manager = static_cast<AudioTapManager*>(inClientData);
+    if (!manager) {
+        return noErr;
+    }
+    
+    Logger::info("Process list changed - checking for new audio processes");
+    manager->check_for_new_processes();
+    
+    return noErr;
+}
+
+void AudioTapManager::register_process_list_listener() {
+    if (process_list_listener_registered_) {
+        return;
+    }
+    
+    AudioObjectPropertyAddress addr{
+        kAudioHardwarePropertyProcessObjectList,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    
+    OSStatus status = AudioObjectAddPropertyListener(
+        kAudioObjectSystemObject,
+        &addr,
+        process_list_listener,
+        this
+    );
+    
+    if (status == noErr) {
+        process_list_listener_registered_ = true;
+        Logger::info("Registered listener for new audio processes");
+    } else {
+        Logger::warn("Failed to register process list listener: {}", (int)status);
+    }
+}
+
+void AudioTapManager::unregister_process_list_listener() {
+    if (!process_list_listener_registered_) {
+        return;
+    }
+    
+    AudioObjectPropertyAddress addr{
+        kAudioHardwarePropertyProcessObjectList,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    
+    AudioObjectRemovePropertyListener(
+        kAudioObjectSystemObject,
+        &addr,
+        process_list_listener,
+        this
+    );
+    
+    process_list_listener_registered_ = false;
+    Logger::debug("Unregistered process list listener");
+}
+
+void AudioTapManager::check_for_new_processes() {
+    if (!is_running_ || debug_global_only_ || debug_single_pid_ > 0) {
+        return;
+    }
+    
+    // Prevent concurrent rebuilds
+    if (rebuild_in_progress_.load(std::memory_order_acquire)) {
+        Logger::debug("Rebuild already in progress, ignoring process list change");
+        return;
+    }
+    
+    auto current_processes = discover_audio_processes();
+    if (current_processes.empty()) {
+        return;
+    }
+    
+    // Get PIDs we're already monitoring
+    std::unordered_set<pid_t> monitored_pids;
+    for (const auto& tap : process_taps_) {
+        monitored_pids.insert(tap->pid);
+    }
+    
+    // Find new processes
+    std::vector<pid_t> new_pids;
+    for (AudioObjectID obj_id : current_processes) {
+        pid_t pid = get_pid_from_audio_object(obj_id);
+        if (pid > 0 && !monitored_pids.count(pid)) {
+            new_pids.push_back(pid);
+        }
+    }
+    
+    if (!new_pids.empty()) {
+        Logger::info("Found {} new audio process(es)", new_pids.size());
+        for (pid_t pid : new_pids) {
+            Logger::info("  New PID: {}", pid);
+        }
+        
+        rebuild_taps_if_needed();
+    }
+}
+
+bool AudioTapManager::rebuild_taps_if_needed() {
+    // Set flag to prevent concurrent rebuilds
+    bool expected = false;
+    if (!rebuild_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+        Logger::warn("Rebuild already in progress, skipping");
+        return false;
+    }
+    
+    Logger::info("Rebuilding audio taps to include new processes");
+    
+    // Unregister listener to prevent recursive triggers during rebuild
+    unregister_process_list_listener();
+    
+    // Stop the current setup
+    if (io_proc_id_ != nullptr) {
+        AudioDeviceStop(aggregate_device_id_, io_proc_id_);
+        AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
+        io_proc_id_ = nullptr;
+    }
+    
+    destroy_aggregate_device();
+    process_taps_.clear();
+    
+    // Wait for Core Audio to fully clean up the old taps
+    // The system needs time to release resources before creating new taps
+    Logger::debug("Waiting for tap cleanup...");
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    
+    // Rediscover and create taps for all current processes
+    auto process_objects = discover_audio_processes();
+    if (process_objects.empty()) {
+        Logger::warn("No audio processes found during rebuild");
+        rebuild_in_progress_.store(false, std::memory_order_release);
+        return false;
+    }
+    
+    std::unordered_set<pid_t> seen;
+    for (AudioObjectID obj_id : process_objects) {
+        pid_t pid = get_pid_from_audio_object(obj_id);
+        if (pid > 0 && !seen.count(pid)) {
+            seen.insert(pid);
+            Logger::info("Creating tap for PID {} during rebuild", pid);
+            create_tap_for_process(pid);
+        }
+    }
+    
+    if (process_taps_.empty()) {
+        Logger::error("Failed to create any process taps during rebuild");
+        rebuild_in_progress_.store(false, std::memory_order_release);
+        return false;
+    }
+    
+    // Collect tap UIDs
+    std::vector<CFStringRef> tap_uids;
+    for (const auto& tap : process_taps_) {
+        CFStringRef tap_uid = nullptr;
+        UInt32 data_size = sizeof(tap_uid);
+        AudioObjectPropertyAddress prop_addr{
+            kAudioTapPropertyUID,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        
+        OSStatus status = AudioObjectGetPropertyData(
+            tap->tap_id,
+            &prop_addr,
+            0,
+            nullptr,
+            &data_size,
+            &tap_uid
+        );
+        
+        if (status == noErr && tap_uid) {
+            tap_uids.push_back(tap_uid);
+        }
+    }
+    
+    // Create new aggregate device
+    if (!create_aggregate_device(tap_uids)) {
+        for (auto uid : tap_uids) {
+            if (uid) CFRelease(uid);
+        }
+        rebuild_in_progress_.store(false, std::memory_order_release);
+        return false;
+    }
+    
+    for (auto uid : tap_uids) {
+        if (uid) CFRelease(uid);
+    }
+    
+    // Wait for device to be ready
+    if (!wait_for_device_ready(aggregate_device_id_, 2.0)) {
+        Logger::warn("Aggregate device did not become ready after rebuild");
+    }
+    
+    // Register IOProc callback
+    OSStatus status = AudioDeviceCreateIOProcID(
+        aggregate_device_id_,
+        audio_io_proc,
+        this,
+        &io_proc_id_
+    );
+    
+    if (status != noErr) {
+        Logger::error("Failed to create IOProcID after rebuild: {}", status);
+        rebuild_in_progress_.store(false, std::memory_order_release);
+        return false;
+    }
+    
+    // Start the device
+    status = AudioDeviceStart(aggregate_device_id_, io_proc_id_);
+    if (status != noErr) {
+        Logger::error("Failed to start aggregate device after rebuild: {}", status);
+        rebuild_in_progress_.store(false, std::memory_order_release);
+        return false;
+    
+    // Re-register listener for future changes
+    register_process_list_listener();
+    
+    }
+    
+    Logger::info("Successfully rebuilt taps - now monitoring {} processes", process_taps_.size());
+    rebuild_in_progress_.store(false, std::memory_order_release);
+    return true;
+}
+
+
 bool AudioTapManager::start() {
     if (is_running_) {
         return false;
@@ -308,6 +541,10 @@ bool AudioTapManager::start() {
 
     Logger::info("Started aggregate device with {} taps", process_taps_.size());
     is_running_ = true;
+    
+    // Register listener for new audio processes
+    register_process_list_listener();
+    
     return true;
 }
 
@@ -315,6 +552,9 @@ void AudioTapManager::stop() {
     if (!is_running_) {
         return;
     }
+
+    // Unregister process list listener
+    unregister_process_list_listener();
 
     // Stop aggregate device
     if (aggregate_device_id_ != kAudioObjectUnknown && io_proc_id_ != nullptr) {
@@ -594,10 +834,32 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         
         // Create the tap - THIS WILL TRIGGER THE PERMISSION PROMPT!
         AudioObjectID tap_id = kAudioObjectUnknown;
-        OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
+        OSStatus status = noErr;
+        
+        // Retry with exponential backoff - Core Audio may not be ready immediately after cleanup
+        const int max_retries = 3;
+        for (int attempt = 0; attempt < max_retries; ++attempt) {
+            if (attempt > 0) {
+                int delay_ms = 100 * (1 << (attempt - 1)); // 100ms, 200ms
+                Logger::debug("Retry {} for PID {} after {}ms", attempt, pid, delay_ms);
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+            }
+            
+            status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
+            
+            if (status == noErr && tap_id != kAudioObjectUnknown) {
+                break; // Success!
+            }
+            
+            if (attempt < max_retries - 1) {
+                Logger::debug("Tap creation returned status={} tap_id={}, retrying...", 
+                             (int)status, tap_id);
+            }
+        }
         
         if (status != noErr || tap_id == kAudioObjectUnknown) {
-            Logger::error("AudioHardwareCreateProcessTap failed for PID {} with status {}", pid, (int)status);
+            Logger::error("AudioHardwareCreateProcessTap failed for PID {} after {} attempts (status={})", 
+                         pid, max_retries, (int)status);
             return false;
         }
         

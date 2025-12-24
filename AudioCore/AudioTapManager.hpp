@@ -113,6 +113,23 @@ private:
     std::vector<AudioObjectID> discover_audio_processes();
     pid_t get_pid_from_audio_object(AudioObjectID obj_id);
     AudioStreamBasicDescription get_stream_format() const;
+    
+    // Process monitoring
+    void register_process_list_listener();
+    void unregister_process_list_listener();
+    void check_for_new_processes();
+    bool rebuild_taps_if_needed();
+    
+    // Property listener callback for new processes
+    static OSStatus process_list_listener(
+        AudioObjectID inObjectID,
+        UInt32 inNumberAddresses,
+        const AudioObjectPropertyAddress inAddresses[],
+        void* inClientData
+    );
+    
+    bool process_list_listener_registered_ = false;
+    std::atomic<bool> rebuild_in_progress_{false};
 
     // Core Audio callback (REALTIME SAFE) - for aggregate device
     static OSStatus audio_io_proc(
