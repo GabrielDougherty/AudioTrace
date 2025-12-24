@@ -18,6 +18,7 @@ public:
     struct AppInfo {
         std::string name;
         std::string bundle_id;
+        std::string window_title;  // Main window title, if available
         pid_t pid;
         #ifdef __OBJC__
         NSImage* __strong icon;  // Retained
@@ -35,6 +36,9 @@ public:
 
     /// Get just the application name (lighter weight)
     static std::optional<std::string> get_app_name(pid_t pid);
+
+    /// Get the main window title for a process (if available)
+    static std::optional<std::string> get_window_title(pid_t pid);
 
     /// Check if process is still running
     static bool is_process_alive(pid_t pid);

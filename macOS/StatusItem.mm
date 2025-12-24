@@ -59,11 +59,29 @@
         [self.menu addItem:item];
     } else {
         for (const auto& snapshot : snapshots) {
-            // Get process info
-            auto app_info = AudioTrace::ProcessInfo::get_app_name(snapshot.pid);
-            NSString* appName = app_info.has_value() 
-                ? [NSString stringWithUTF8String:app_info->c_str()]
-                : [NSString stringWithFormat:@"PID %d", snapshot.pid];
+            // Try to get app info first
+            auto app_info = AudioTrace::ProcessInfo::get_app_info(snapshot.pid);
+            
+            // Even if app info fails, try to get window title directly
+            auto window_title = AudioTrace::ProcessInfo::get_window_title(snapshot.pid);
+            
+            NSString* displayName;
+            if (app_info.has_value()) {
+                // We have app name
+                if (!app_info->window_title.empty()) {
+                    NSString* windowTitle = [NSString stringWithUTF8String:app_info->window_title.c_str()];
+                    NSString* appName = [NSString stringWithUTF8String:app_info->name.c_str()];
+                    displayName = [NSString stringWithFormat:@"%@: %@", appName, windowTitle];
+                } else {
+                    displayName = [NSString stringWithUTF8String:app_info->name.c_str()];
+                }
+            } else if (window_title.has_value()) {
+                // No app info but we have window title
+                displayName = [NSString stringWithUTF8String:window_title->c_str()];
+            } else {
+                // Fallback to PID
+                displayName = [NSString stringWithFormat:@"PID %d", snapshot.pid];
+            }
 
             // Format time ago
             NSString* timeStr;
@@ -83,7 +101,7 @@
                 }
             }
 
-            NSString* title = [NSString stringWithFormat:@"%@ — %@", appName, timeStr];
+            NSString* title = [NSString stringWithFormat:@"%@ — %@", displayName, timeStr];
             NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title
                                                           action:nil
                                                    keyEquivalent:@""];
