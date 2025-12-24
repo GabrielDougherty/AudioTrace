@@ -16,6 +16,7 @@ struct ActivitySnapshot {
     float last_rms_level;
     float last_peak_level;
     bool is_currently_playing;  // Heard within last 500ms
+    std::string cached_window_title;  // Window title from first capture (may be empty)
 };
 
 /// Tracks audio activity per process
@@ -46,6 +47,9 @@ public:
     /// Get number of tracked processes
     size_t process_count() const;
 
+    /// Update cached window title for a process (if not already set)
+    void cache_window_title(pid_t pid, const std::string& title);
+
 private:
     Config config_;
     
@@ -53,6 +57,7 @@ private:
         std::chrono::steady_clock::time_point last_heard;
         float last_rms_level;
         float last_peak_level;
+        std::string cached_window_title;  // Cached from first successful capture
     };
 
     mutable std::mutex mutex_;

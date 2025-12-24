@@ -1,4 +1,5 @@
 #include "ActivityTracker.hpp"
+#include "Logger.hpp"
 #include <algorithm>
 
 namespace AudioTrace {
@@ -12,11 +13,22 @@ ActivityTracker::~ActivityTracker() = default;
 void ActivityTracker::record_activity(const ActivityEvent& event) {
     std::scoped_lock lock(mutex_);
     
-    activities_[event.pid] = ProcessActivity{
-        .last_heard = event.timestamp,
-        .last_rms_level = event.rms_level,
-        .last_peak_level = event.peak_level
-    };
+    // Check if this is a new process or update existing
+    auto it = activities_.find(event.pid);
+    if (it != activities_.end()) {
+        // Update existing entry, keep cached window title
+        it->second.last_heard = event.timestamp;
+        it->second.last_rms_level = event.rms_level;
+        it->second.last_peak_level = event.peak_level;
+    } else {
+        // New entry - will cache window title in snapshot()
+        activities_[event.pid] = ProcessActivity{
+            .last_heard = event.timestamp,
+            .last_rms_level = event.rms_level,
+            .last_peak_level = event.peak_level,
+            .cached_window_title = ""
+        };
+    }
 }
 
 std::vector<ActivitySnapshot> ActivityTracker::snapshot() const {
@@ -36,7 +48,8 @@ std::vector<ActivitySnapshot> ActivityTracker::snapshot() const {
             .last_heard = activity.last_heard,
             .last_rms_level = activity.last_rms_level,
             .last_peak_level = activity.last_peak_level,
-            .is_currently_playing = elapsed < config_.current_threshold
+            .is_currently_playing = elapsed < config_.current_threshold,
+            .cached_window_title = activity.cached_window_title
         });
     }
 
@@ -67,6 +80,16 @@ void ActivityTracker::cleanup_expired() {
 size_t ActivityTracker::process_count() const {
     std::scoped_lock lock(mutex_);
     return activities_.size();
+}
+
+void ActivityTracker::cache_window_title(pid_t pid, const std::string& title) {
+    std::scoped_lock lock(mutex_);
+    
+    auto it = activities_.find(pid);
+    if (it != activities_.end() && it->second.cached_window_title.empty() && !title.empty()) {
+        it->second.cached_window_title = title;
+        Logger::debug("Cached window title '{}' for PID {}", title, pid);
+    }
 }
 
 }  // namespace AudioTrace

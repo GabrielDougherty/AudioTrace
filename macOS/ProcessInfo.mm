@@ -64,11 +64,80 @@ std::optional<ProcessInfo::AppInfo> ProcessInfo::get_app_info(pid_t pid) {
 std::optional<std::string> ProcessInfo::get_app_name(pid_t pid) {
     @autoreleasepool {
         NSRunningApplication* app = get_running_app(pid);
-        if (!app || !app.localizedName) {
-            return std::nullopt;
+        if (app && app.localizedName) {
+            return std::string([app.localizedName UTF8String]);
         }
-
-        return std::string([app.localizedName UTF8String]);
+        
+        // For helper processes, try to find the responsible application
+        // using bundle ID matching
+        if (app && app.bundleIdentifier) {
+            NSString* bundleId = app.bundleIdentifier;
+            Logger::debug("PID {} has bundle ID: {}", pid, [bundleId UTF8String]);
+            
+            // For Messages helpers (e.g., com.apple.imagent), look for the main app
+            if ([bundleId containsString:@"message"] || [bundleId containsString:@"imessage"] || 
+                [bundleId isEqualToString:@"com.apple.imagent"] || 
+                [bundleId isEqualToString:@"com.apple.IMDPersistenceAgent"]) {
+                NSArray<NSRunningApplication*>* messagesApps = 
+                    [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.MobileSMS"];
+                if (messagesApps.count > 0) {
+                    Logger::debug("Found Messages app for helper PID {} (bundle: {})", 
+                                 pid, [bundleId UTF8String]);
+                    return std::string("Messages");
+                }
+            }
+            
+            // Generic fallback: try parent PID
+            pid_t parent = get_parent_pid(pid);
+            if (parent > 0 && parent != pid && parent != 1) {
+                NSRunningApplication* parentApp = get_running_app(parent);
+                if (parentApp && parentApp.localizedName) {
+                    Logger::debug("Got app name '{}' from parent PID {} for helper PID {}", 
+                                 [parentApp.localizedName UTF8String], parent, pid);
+                    return std::string([parentApp.localizedName UTF8String]);
+                }
+            }
+        } else {
+            // No bundle ID - likely a system daemon
+            // Try to get the process path using proc_pidpath
+            char process_path[PROC_PIDPATHINFO_MAXSIZE];
+            int ret = proc_pidpath(pid, process_path, sizeof(process_path));
+            if (ret > 0) {
+                // Extract just the process name from the path
+                const char* process_name = strrchr(process_path, '/');
+                process_name = process_name ? process_name + 1 : process_path;
+                Logger::debug("PID {} has no bundle identifier, process name: {}", pid, process_name);
+                
+                // Special case: system audio daemons playing notification sounds
+                // Heuristic: coreaudiod often plays notification sounds for Messages
+                if (strcmp(process_name, "coreaudiod") == 0) {
+                    // Check if Messages is running - if so, attribute to Messages
+                    NSArray<NSRunningApplication*>* messagesApps = 
+                        [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.MobileSMS"];
+                    if (messagesApps.count > 0) {
+                        Logger::debug("Attributing coreaudiod (PID {}) to Messages (heuristic)", pid);
+                        return std::string("Messages (notifications)");
+                    }
+                    return std::string("System Audio");
+                }
+                
+                // Return the process name
+                return std::string(process_name);
+            } else {
+                Logger::debug("PID {} has no bundle identifier and proc_pidpath failed", pid);
+                
+                // Last resort heuristic: if Messages is running and we can't identify the process,
+                // assume it's a notification sound
+                NSArray<NSRunningApplication*>* messagesApps = 
+                    [NSRunningApplication runningApplicationsWithBundleIdentifier:@"com.apple.MobileSMS"];
+                if (messagesApps.count > 0) {
+                    Logger::debug("Unknown PID {} attributed to Messages (fallback heuristic)", pid);
+                    return std::string("Messages (notifications)");
+                }
+            }
+        }
+        
+        return std::nullopt;
     }
 }
 

@@ -60,28 +60,44 @@
         [self.menu addItem:item];
     } else {
         for (const auto& snapshot : snapshots) {
-            // Try to get app info first
-            auto app_info = AudioTrace::ProcessInfo::get_app_info(snapshot.pid);
+            NSString* displayName = nil;
             
-            // Even if app info fails, try to get window title directly
-            auto window_title = AudioTrace::ProcessInfo::get_window_title(snapshot.pid);
+            // First, always try to get the app name (lightweight and reliable)
+            auto app_name = AudioTrace::ProcessInfo::get_app_name(snapshot.pid);
+            NSString* appName = app_name.has_value() 
+                ? [NSString stringWithUTF8String:app_name->c_str()]
+                : nil;
             
-            NSString* displayName;
-            if (app_info.has_value()) {
-                // We have app name
-                if (!app_info->window_title.empty()) {
-                    NSString* windowTitle = [NSString stringWithUTF8String:app_info->window_title.c_str()];
-                    NSString* appName = [NSString stringWithUTF8String:app_info->name.c_str()];
+            // Check if we have a cached window title from the snapshot
+            if (!snapshot.cached_window_title.empty()) {
+                NSString* windowTitle = [NSString stringWithUTF8String:snapshot.cached_window_title.c_str()];
+                if (appName) {
                     displayName = [NSString stringWithFormat:@"%@: %@", appName, windowTitle];
                 } else {
-                    displayName = [NSString stringWithUTF8String:app_info->name.c_str()];
+                    displayName = windowTitle;
                 }
-            } else if (window_title.has_value()) {
-                // No app info but we have window title
-                displayName = [NSString stringWithUTF8String:window_title->c_str()];
             } else {
-                // Fallback to PID
-                displayName = [NSString stringWithFormat:@"PID %d", snapshot.pid];
+                // No cached title - try to get window title and cache it if available
+                auto window_title = AudioTrace::ProcessInfo::get_window_title(snapshot.pid);
+                
+                if (window_title.has_value() && !window_title->empty()) {
+                    NSString* windowTitle = [NSString stringWithUTF8String:window_title->c_str()];
+                    if (appName) {
+                        displayName = [NSString stringWithFormat:@"%@: %@", appName, windowTitle];
+                    } else {
+                        displayName = windowTitle;
+                    }
+                    // Cache this title for future use
+                    self.tapManager->cache_window_title(snapshot.pid, *window_title);
+                } else {
+                    // No window title available - just show app name
+                    if (appName) {
+                        displayName = appName;
+                    } else {
+                        // Last resort fallback to PID
+                        displayName = [NSString stringWithFormat:@"PID %d", snapshot.pid];
+                    }
+                }
             }
 
             // Format time ago

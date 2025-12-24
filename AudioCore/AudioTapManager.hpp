@@ -58,6 +58,9 @@ public:
     /// Get list of currently tapped process IDs
     std::vector<pid_t> get_tapped_processes() const;
 
+    /// Cache window title for a process (called from UI thread)
+    void cache_window_title(pid_t pid, const std::string& title);
+
 private:
     AudioObjectID find_process_object_for_pid(pid_t pid);
     void log_available_audio_processes();

@@ -16,5 +16,7 @@ Only mark these done AFTER confirming they are done by testing
 ```
     - added [super dealloc] call to StatusItem.mm dealloc method
 [x] Allow clicking on the item to raise its window (idk if this is possible)
+[x] Messages app does not have a proper title after emitting sound
+[ ] Applications launched after launching AudioTrace are not monitored
 [ ] Put the app icon in the list
 [ ] Update permission flow to tell user exactly how to enable permissions for Rudolph

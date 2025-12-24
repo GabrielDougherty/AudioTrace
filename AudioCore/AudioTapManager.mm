@@ -357,6 +357,10 @@ std::vector<ActivitySnapshot> AudioTapManager::get_activity_snapshot() const {
     return tracker_.snapshot();
 }
 
+void AudioTapManager::cache_window_title(pid_t pid, const std::string& title) {
+    tracker_.cache_window_title(pid, title);
+}
+
 void AudioTapManager::worker_thread_proc() {
     Logger::debug("Worker thread started, taps={}", process_taps_.size());
     int loop_count = 0;
