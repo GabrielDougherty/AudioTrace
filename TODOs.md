@@ -15,6 +15,6 @@ Only mark these done AFTER confirming they are done by testing
 1 warning
 ```
     - added [super dealloc] call to StatusItem.mm dealloc method
-[ ] Allow clicking on the item to raise its window (idk if this is possible)
+[x] Allow clicking on the item to raise its window (idk if this is possible)
 [ ] Put the app icon in the list
 [ ] Update permission flow to tell user exactly how to enable permissions for Rudolph

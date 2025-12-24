@@ -10,8 +10,7 @@ namespace AudioTrace {
 
 #ifdef __OBJC__
 
-// Helper to get parent PID
-static pid_t get_parent_pid(pid_t pid) {
+pid_t ProcessInfo::get_parent_pid(pid_t pid) {
     struct kinfo_proc info;
     size_t length = sizeof(struct kinfo_proc);
     int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, pid };
@@ -79,7 +78,7 @@ std::optional<std::string> ProcessInfo::get_window_title(pid_t pid) {
         std::vector<pid_t> pids_to_try = {pid};
         
         // Add parent PID (helper processes might not have windows, but parent does)
-        pid_t parent = get_parent_pid(pid);
+        pid_t parent = ProcessInfo::get_parent_pid(pid);
         if (parent > 0 && parent != pid) {
             pids_to_try.push_back(parent);
         }
@@ -157,6 +156,30 @@ bool ProcessInfo::is_process_alive(pid_t pid) {
     // Use kill with signal 0 to check if process exists
     // Returns 0 if process exists, -1 if not
     return kill(pid, 0) == 0;
+}
+
+NSRunningApplication* ProcessInfo::get_activatable_app(pid_t pid) {
+    // Don't use @autoreleasepool here - we need the returned object to stay alive
+    // Try the direct PID first
+    NSRunningApplication* app = get_running_app(pid);
+    if (app) {
+        Logger::debug("Found running application for PID {}", pid);
+        return app;
+    }
+    
+    // If not found, try the parent PID (for helper processes)
+    pid_t parent = ProcessInfo::get_parent_pid(pid);
+    if (parent > 0 && parent != pid) {
+        Logger::debug("PID {} not activatable, trying parent PID {}", pid, parent);
+        app = get_running_app(parent);
+        if (app) {
+            Logger::debug("Found parent application for PID {} -> {}", pid, parent);
+            return app;
+        }
+    }
+    
+    Logger::warn("Could not find activatable application for PID {} (parent: {})", pid, parent);
+    return nil;
 }
 
 #endif  // __OBJC__

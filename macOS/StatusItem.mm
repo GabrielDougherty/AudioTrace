@@ -104,12 +104,16 @@
 
             NSString* title = [NSString stringWithFormat:@"%@ — %@", displayName, timeStr];
             NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title
-                                                          action:nil
+                                                          action:@selector(raiseWindow:)
                                                    keyEquivalent:@""];
+            
+            // Store the PID in the menu item's tag
+            item.tag = snapshot.pid;
             
             // TODO: Set app icon as item.image if available
             
-            item.enabled = NO;
+            item.target = self;
+            item.enabled = YES;
             [self.menu addItem:item];
         }
     }
@@ -122,6 +126,24 @@
                                                keyEquivalent:@"q"];
     quitItem.target = NSApp;
     [self.menu addItem:quitItem];
+}
+
+- (void)raiseWindow:(NSMenuItem*)sender {
+    pid_t pid = sender.tag;
+    
+    AudioTrace::Logger::debug("Attempting to raise window for PID {}", pid);
+    
+    // Get the activatable application for this PID (handles helper processes)
+    NSRunningApplication* app = AudioTrace::ProcessInfo::get_activatable_app(pid);
+    if (!app) {
+        // Warning already logged in get_activatable_app
+        return;
+    }
+    
+    // Activate the application (bring it to front)
+    [app activateWithOptions:NSApplicationActivateAllWindows];
+    
+    AudioTrace::Logger::debug("Activated application successfully");
 }
 
 #pragma mark - NSMenuDelegate

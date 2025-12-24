@@ -43,9 +43,16 @@ public:
     /// Check if process is still running
     static bool is_process_alive(pid_t pid);
 
+    #ifdef __OBJC__
+    /// Get the activatable NSRunningApplication for a PID
+    /// For helper processes, tries to get the parent application
+    static NSRunningApplication* get_activatable_app(pid_t pid);
+    #endif
+
 private:
     #ifdef __OBJC__
     static NSRunningApplication* get_running_app(pid_t pid);
+    static pid_t get_parent_pid(pid_t pid);
     #endif
 };
 
