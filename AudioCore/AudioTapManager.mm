@@ -266,6 +266,12 @@ void AudioTapManager::check_for_new_processes() {
             Logger::info("  New PID: {}", pid);
         }
         
+        // Store new PIDs for rebuild
+        {
+            std::scoped_lock lock(pending_pids_mutex_);
+            pending_new_pids_.insert(pending_new_pids_.end(), new_pids.begin(), new_pids.end());
+        }
+        
         rebuild_taps_if_needed();
     }
 }
@@ -283,52 +289,51 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     // Unregister listener to prevent recursive triggers during rebuild
     unregister_process_list_listener();
     
-    // Stop the current setup
+    // Stop the IOProc and destroy aggregate, but KEEP existing taps alive
     if (io_proc_id_ != nullptr) {
         AudioDeviceStop(aggregate_device_id_, io_proc_id_);
         AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
         io_proc_id_ = nullptr;
         
-        // Wait for Core Audio to fully release the device before destroying
         Logger::debug("Waiting for device to stop...");
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     
+    // Destroy only the aggregate device, not the taps
+    destroy_aggregate_device_only();
+    
+    // Get the list of NEW PIDs we need to create taps for
+    std::vector<pid_t> new_pids;
     {
-        std::scoped_lock lock(process_taps_mutex_);
-        destroy_aggregate_device();
-        process_taps_.clear();
+        std::scoped_lock lock(pending_pids_mutex_);
+        new_pids = std::move(pending_new_pids_);
+        pending_new_pids_.clear();
     }
     
-    // Wait for Core Audio to fully clean up the old taps
-    // The system needs time to release resources before creating new taps
-    // Increased delay needed after locking changes to ensure full cleanup
-    Logger::debug("Waiting for tap cleanup...");
-    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
-    
-    // Rediscover and create taps for all current processes
-    auto process_objects = discover_audio_processes();
-    if (process_objects.empty()) {
-        Logger::warn("No audio processes found during rebuild");
+    if (new_pids.empty()) {
+        Logger::warn("No new PIDs to add during rebuild");
         rebuild_in_progress_.store(false, std::memory_order_release);
+        register_process_list_listener();
         return false;
     }
     
-    std::unordered_set<pid_t> seen;
-    bool tap_creation_failed_stale_objects = false;
-    for (AudioObjectID obj_id : process_objects) {
-        pid_t pid = get_pid_from_audio_object(obj_id);
-        if (pid > 0 && !seen.count(pid)) {
-            seen.insert(pid);
-            Logger::info("Creating tap for PID {} during rebuild", pid);
-            if (!create_tap_for_process(pid)) {
-                // If tap creation failed, process objects are likely stale
-                // Don't continue spinning through the rest
-                Logger::warn("Tap creation failed for PID {} - aborting rebuild (likely stale process objects)", pid);
-                tap_creation_failed_stale_objects = true;
-                break;
-            }
+    // Only create taps for the NEW processes - existing taps stay alive
+    Logger::info("Creating taps for {} new process(es)", new_pids.size());
+    int failed_tap_count = 0;
+    int successful_tap_count = 0;
+    
+    for (pid_t pid : new_pids) {
+        Logger::info("Creating tap for PID {} during rebuild", pid);
+        if (!create_tap_for_process(pid)) {
+            Logger::warn("Tap creation failed for PID {}", pid);
+            failed_tap_count++;
+        } else {
+            successful_tap_count++;
         }
+    }
+    
+    if (failed_tap_count > 0) {
+        Logger::info("Failed to create taps for {} process(es) during rebuild", failed_tap_count);
     }
 
     std::vector<CFStringRef> tap_uids;
@@ -337,18 +342,6 @@ bool AudioTapManager::rebuild_taps_if_needed() {
         std::scoped_lock lock(process_taps_mutex_);
         if (process_taps_.empty()) {
             Logger::error("Failed to create any process taps during rebuild");
-            
-            // Clear any pending rebuild request and sleep before returning
-            // This lets Core Audio refresh the process object list
-            rebuild_requested_.store(false, std::memory_order_release);
-            rebuild_in_progress_.store(false, std::memory_order_release);
-            
-            Logger::debug("Sleeping 1s to let Core Audio refresh process objects");
-            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-            
-            // Re-register listener so we can detect changes and try again
-            register_process_list_listener();
-            return false;
         }
         
         // Collect tap UIDs
@@ -374,6 +367,21 @@ bool AudioTapManager::rebuild_taps_if_needed() {
                 tap_uids.push_back(tap_uid);
             }
         }
+    }
+    
+    // Check if we failed to create any taps (after releasing mutex)
+    if (tap_uids.empty()) {
+        // DON'T clear rebuild_requested_ - keep it set if new processes arrived
+        rebuild_in_progress_.store(false, std::memory_order_release);
+        
+        Logger::debug("Sleeping 1s to let Core Audio refresh process objects");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        
+        register_process_list_listener();
+        
+        // Explicitly trigger check for new processes to retry rebuild
+        check_for_new_processes();
+        return false;
     }
         
     // Create new aggregate device
@@ -423,9 +431,26 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     rebuild_in_progress_.store(false, std::memory_order_release);
     
     // Check if another rebuild was requested while we were rebuilding
-    if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
-        Logger::info("Rebuild was requested during previous rebuild - running another rebuild now");
-        return rebuild_taps_if_needed();
+    // Use a tail-call loop to avoid unbounded recursion
+    const int max_consecutive_rebuilds = 5;
+    int rebuild_count = 0;
+    while (rebuild_requested_.exchange(false, std::memory_order_acq_rel) && rebuild_count < max_consecutive_rebuilds) {
+        Logger::info("Rebuild was requested during previous rebuild - running another rebuild now (iteration {})", rebuild_count + 1);
+        rebuild_count++;
+        
+        // Actually run the rebuild by calling ourselves
+        // This is tail-recursion so won't blow the stack for reasonable rebuild counts
+        if (!rebuild_taps_if_needed()) {
+            // Rebuild failed, break out
+            break;
+        }
+        
+        // After successful rebuild, check again if another was requested
+        // Loop will continue if so
+    }
+    
+    if (rebuild_count >= max_consecutive_rebuilds) {
+        Logger::warn("Hit max consecutive rebuilds ({}), stopping rebuild loop", max_consecutive_rebuilds);
     }
     
     return true;
@@ -937,8 +962,18 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
                     Logger::warn("Process object for PID {} is stale/gone - aborting tap creation", pid);
                     return false;
                 }
-                // Process still exists but tap creation returning unknown - likely Core Audio not ready
-                // Continue retrying
+                // If we got a fresh object ID, recreate the tap descriptor with it
+                if (fresh_obj_id != process_obj_id) {
+                    Logger::debug("Recreating tap descriptor with fresh object ID {} (was {})", fresh_obj_id, process_obj_id);
+                    process_obj_id = fresh_obj_id;
+                    processID = @(process_obj_id);
+                    processes = @[processID];
+                    tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
+                    tapDesc.exclusive = NO;
+                    tapDesc.muteBehavior = CATapUnmuted;
+                    tapDesc.privateTap = YES;
+                }
+                // Continue retrying with the fresh tap descriptor
             }
             
             if (attempt < max_retries - 1) {
@@ -1177,6 +1212,14 @@ void AudioTapManager::destroy_aggregate_device() {
         }
         
         // Then destroy the aggregate device
+        AudioHardwareDestroyAggregateDevice(aggregate_device_id_);
+        aggregate_device_id_ = kAudioObjectUnknown;
+    }
+}
+
+void AudioTapManager::destroy_aggregate_device_only() {
+    // Destroy only the aggregate device, keep taps alive
+    if (aggregate_device_id_ != kAudioObjectUnknown) {
         AudioHardwareDestroyAggregateDevice(aggregate_device_id_);
         aggregate_device_id_ = kAudioObjectUnknown;
     }

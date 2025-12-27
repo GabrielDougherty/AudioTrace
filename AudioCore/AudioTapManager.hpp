@@ -108,6 +108,7 @@ private:
     // Helper methods
     bool create_aggregate_device(const std::vector<CFStringRef>& tap_uids);
     void destroy_aggregate_device();
+    void destroy_aggregate_device_only(); // Destroy only aggregate, keep taps alive
     bool wait_for_device_ready(AudioObjectID device_id, double timeout_seconds);
     bool create_tap_for_process(pid_t pid);
     std::vector<AudioObjectID> discover_audio_processes();
@@ -131,6 +132,8 @@ private:
     bool process_list_listener_registered_ = false;
     std::atomic<bool> rebuild_in_progress_{false};
     std::atomic<bool> rebuild_requested_{false};
+    std::vector<pid_t> pending_new_pids_;
+    std::mutex pending_pids_mutex_;
 
     // Core Audio callback (REALTIME SAFE) - for aggregate device
     static OSStatus audio_io_proc(
