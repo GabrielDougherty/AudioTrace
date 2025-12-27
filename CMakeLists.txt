@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.25)
 project(AudioTrace VERSION 1.0.0 LANGUAGES CXX OBJCXX)
 
+# Generate compile_commands.json for IDE support
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 # C++23 standard
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

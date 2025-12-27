@@ -26,3 +26,9 @@ DerivedData/
 _build/
 *.install
 .merlin
+
+# clangd
+.cache
+
+# debug binary
+test_activity
