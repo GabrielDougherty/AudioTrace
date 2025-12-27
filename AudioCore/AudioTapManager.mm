@@ -380,11 +380,10 @@ bool AudioTapManager::rebuild_taps_if_needed() {
         Logger::error("Failed to start aggregate device after rebuild: {}", status);
         rebuild_in_progress_.store(false, std::memory_order_release);
         return false;
+    }
     
     // Re-register listener for future changes
     register_process_list_listener();
-    
-    }
     
     Logger::info("Successfully rebuilt taps - now monitoring {} processes", process_taps_.size());
     rebuild_in_progress_.store(false, std::memory_order_release);
@@ -836,13 +835,11 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         AudioObjectID tap_id = kAudioObjectUnknown;
         OSStatus status = noErr;
         
-        // Retry with exponential backoff - Core Audio may not be ready immediately after cleanup
+        // Retry, Core Audio may not be ready immediately after cleanup
         const int max_retries = 3;
         for (int attempt = 0; attempt < max_retries; ++attempt) {
             if (attempt > 0) {
-                int delay_ms = 100 * (1 << (attempt - 1)); // 100ms, 200ms
-                Logger::debug("Retry {} for PID {} after {}ms", attempt, pid, delay_ms);
-                std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
             
             status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
