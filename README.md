@@ -55,4 +55,4 @@ On first launch, you'll be prompted to grant audio input permissions in System S
 
 ## License
 
-TBD
+ISC
