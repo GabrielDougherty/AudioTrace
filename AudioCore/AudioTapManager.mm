@@ -1,5 +1,6 @@
 #include "AudioTapManager.hpp"
 #include "Logger.hpp"
+#include <mutex>
 #include <thread>
 #include <algorithm>
 #include <unordered_set>
@@ -242,8 +243,11 @@ void AudioTapManager::check_for_new_processes() {
     
     // Get PIDs we're already monitoring
     std::unordered_set<pid_t> monitored_pids;
-    for (const auto& tap : process_taps_) {
-        monitored_pids.insert(tap->pid);
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        for (const auto& tap : process_taps_) {
+            monitored_pids.insert(tap->pid);
+        }
     }
     
     // Find new processes
@@ -283,15 +287,23 @@ bool AudioTapManager::rebuild_taps_if_needed() {
         AudioDeviceStop(aggregate_device_id_, io_proc_id_);
         AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
         io_proc_id_ = nullptr;
+        
+        // Wait for Core Audio to fully release the device before destroying
+        Logger::debug("Waiting for device to stop...");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
     
-    destroy_aggregate_device();
-    process_taps_.clear();
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        destroy_aggregate_device();
+        process_taps_.clear();
+    }
     
     // Wait for Core Audio to fully clean up the old taps
     // The system needs time to release resources before creating new taps
+    // Increased delay needed after locking changes to ensure full cleanup
     Logger::debug("Waiting for tap cleanup...");
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     
     // Rediscover and create taps for all current processes
     auto process_objects = discover_audio_processes();
@@ -310,38 +322,42 @@ bool AudioTapManager::rebuild_taps_if_needed() {
             create_tap_for_process(pid);
         }
     }
-    
-    if (process_taps_.empty()) {
-        Logger::error("Failed to create any process taps during rebuild");
-        rebuild_in_progress_.store(false, std::memory_order_release);
-        return false;
-    }
-    
-    // Collect tap UIDs
+
     std::vector<CFStringRef> tap_uids;
-    for (const auto& tap : process_taps_) {
-        CFStringRef tap_uid = nullptr;
-        UInt32 data_size = sizeof(tap_uid);
-        AudioObjectPropertyAddress prop_addr{
-            kAudioTapPropertyUID,
-            kAudioObjectPropertyScopeGlobal,
-            kAudioObjectPropertyElementMain
-        };
+    
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        if (process_taps_.empty()) {
+            Logger::error("Failed to create any process taps during rebuild");
+            rebuild_in_progress_.store(false, std::memory_order_release);
+            return false;
+        }
         
-        OSStatus status = AudioObjectGetPropertyData(
-            tap->tap_id,
-            &prop_addr,
-            0,
-            nullptr,
-            &data_size,
-            &tap_uid
-        );
-        
-        if (status == noErr && tap_uid) {
-            tap_uids.push_back(tap_uid);
+        // Collect tap UIDs
+        for (const auto& tap : process_taps_) {
+            CFStringRef tap_uid = nullptr;
+            UInt32 data_size = sizeof(tap_uid);
+            AudioObjectPropertyAddress prop_addr{
+                kAudioTapPropertyUID,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            
+            OSStatus status = AudioObjectGetPropertyData(
+                tap->tap_id,
+                &prop_addr,
+                0,
+                nullptr,
+                &data_size,
+                &tap_uid
+            );
+            
+            if (status == noErr && tap_uid) {
+                tap_uids.push_back(tap_uid);
+            }
         }
     }
-    
+        
     // Create new aggregate device
     if (!create_aggregate_device(tap_uids)) {
         for (auto uid : tap_uids) {
@@ -428,25 +444,37 @@ bool AudioTapManager::start() {
         process_objects = discover_audio_processes();
     }
 
-    if (!process_objects.empty() && process_taps_.empty()) {
-        // Create taps for discovered processes
-        std::unordered_set<pid_t> seen;
-        for (AudioObjectID obj_id : process_objects) {
-            pid_t pid = get_pid_from_audio_object(obj_id);
-            if (pid > 0 && !seen.count(pid)) {
-                seen.insert(pid);
-                Logger::info("Creating tap for PID {}", pid);
-                create_tap_for_process(pid);
+    // Create taps for discovered processes (don't hold lock during creation)
+    if (!process_objects.empty()) {
+        bool should_create_taps = false;
+        {
+            std::scoped_lock lock(process_taps_mutex_);
+            should_create_taps = process_taps_.empty();
+        }
+        
+        if (should_create_taps) {
+            std::unordered_set<pid_t> seen;
+            for (AudioObjectID obj_id : process_objects) {
+                pid_t pid = get_pid_from_audio_object(obj_id);
+                if (pid > 0 && !seen.count(pid)) {
+                    seen.insert(pid);
+                    Logger::info("Creating tap for PID {}", pid);
+                    create_tap_for_process(pid);
+                }
             }
         }
     }
     
-    if (process_taps_.empty() && debug_single_pid_ <= 0) {
-        Logger::error("Failed to create any process taps");
-        return false;
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        if (process_taps_.empty() && debug_single_pid_ <= 0) {
+            Logger::error("Failed to create any process taps");
+            return false;
+        }
     }
 
     if (debug_log_buffers_) {
+        std::scoped_lock lock(process_taps_mutex_);
         for (size_t i = 0; i < process_taps_.size(); ++i) {
             Logger::debug("Tap map: buffer index {} -> PID {} (tap {})",
                   i, process_taps_[i]->pid, process_taps_[i]->tap_id);
@@ -455,26 +483,29 @@ bool AudioTapManager::start() {
     
     // Step 2: Collect tap UIDs for aggregate device
     std::vector<CFStringRef> tap_uids;
-    for (const auto& tap : process_taps_) {
-        CFStringRef tap_uid = nullptr;
-        UInt32 data_size = sizeof(tap_uid);
-        AudioObjectPropertyAddress prop_addr{
-            kAudioTapPropertyUID,
-            kAudioObjectPropertyScopeGlobal,
-            kAudioObjectPropertyElementMain
-        };
-        
-        OSStatus status = AudioObjectGetPropertyData(
-            tap->tap_id,
-            &prop_addr,
-            0,
-            nullptr,
-            &data_size,
-            &tap_uid
-        );
-        
-        if (status == noErr && tap_uid) {
-            tap_uids.push_back(tap_uid);
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        for (const auto& tap : process_taps_) {
+            CFStringRef tap_uid = nullptr;
+            UInt32 data_size = sizeof(tap_uid);
+            AudioObjectPropertyAddress prop_addr{
+                kAudioTapPropertyUID,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain
+            };
+            
+            OSStatus status = AudioObjectGetPropertyData(
+                tap->tap_id,
+                &prop_addr,
+                0,
+                nullptr,
+                &data_size,
+                &tap_uid
+            );
+            
+            if (status == noErr && tap_uid) {
+                tap_uids.push_back(tap_uid);
+            }
         }
     }
 
@@ -526,7 +557,10 @@ bool AudioTapManager::start() {
         return false;
     }
 
-    Logger::info("Started aggregate device with {} taps", process_taps_.size());
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        Logger::info("Started aggregate device with {} taps", process_taps_.size());
+    }
     is_running_ = true;
     
     // Register listener for new audio processes
@@ -559,9 +593,11 @@ void AudioTapManager::stop() {
     worker_thread_.reset();
 
     // Destroy aggregate device and taps
-    destroy_aggregate_device();
-
-    process_taps_.clear();
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        destroy_aggregate_device();
+        process_taps_.clear();
+    }
     is_running_ = false;
 }
 
@@ -570,6 +606,7 @@ void AudioTapManager::set_audio_callback(AudioCallback callback) {
 }
 
 std::vector<pid_t> AudioTapManager::get_tapped_processes() const {
+    std::scoped_lock lock(process_taps_mutex_);
     std::vector<pid_t> result;
     result.reserve(process_taps_.size());
     
@@ -589,7 +626,10 @@ void AudioTapManager::cache_window_title(pid_t pid, const std::string& title) {
 }
 
 void AudioTapManager::worker_thread_proc() {
-    Logger::debug("Worker thread started, taps={}", process_taps_.size());
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        Logger::debug("Worker thread started, taps={}", process_taps_.size());
+    }
     int loop_count = 0;
     int total_pops = 0;
     int samples_checked = 0;
@@ -598,7 +638,17 @@ void AudioTapManager::worker_thread_proc() {
         bool did_work = false;
         int pops_this_loop = 0;
 
-        for (auto& tap : process_taps_) {
+        // Lock briefly to get tap pointers, then process without holding lock
+        std::vector<ProcessTap*> taps_snapshot;
+        {
+            std::scoped_lock lock(process_taps_mutex_);
+            taps_snapshot.reserve(process_taps_.size());
+            for (const auto& tap : process_taps_) {
+                taps_snapshot.push_back(tap.get());
+            }
+        }
+        
+        for (auto* tap : taps_snapshot) {
             AudioTapData data;
             while (tap->ring_buffer.pop(data)) {
                 pops_this_loop++;
@@ -725,15 +775,25 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         return;
     }
     
+    // Lock briefly to get tap pointers, then process without holding lock
+    std::vector<ProcessTap*> taps_snapshot;
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        taps_snapshot.reserve(process_taps_.size());
+        for (const auto& tap : process_taps_) {
+            taps_snapshot.push_back(tap.get());
+        }
+    }
+    
     // Each buffer in the aggregate device corresponds to one tap
     const uint32_t num_buffers = std::min(
         static_cast<uint32_t>(buffer_list->mNumberBuffers),
-        static_cast<uint32_t>(process_taps_.size())
+        static_cast<uint32_t>(taps_snapshot.size())
     );
 
     static int map_log_counter = 0;
     if (debug_log_buffers_ && map_log_counter < 5) {
-        Logger::trace("Mapping {} buffers to {} taps", num_buffers, process_taps_.size());
+        Logger::trace("Mapping {} buffers to {} taps", num_buffers, taps_snapshot.size());
     }
     
     for (uint32_t i = 0; i < num_buffers; ++i) {
@@ -749,7 +809,7 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         const uint32_t frame_count = sample_count / channel_count;
 
         // Send this buffer to the corresponding tap
-        auto& tap = process_taps_[i];
+        auto* tap = taps_snapshot[i];
 
         if (debug_log_buffers_ && map_log_counter < 5) {
             float first = (buffer.mDataByteSize >= sizeof(float)) ? samples[0] : 0.0f;
@@ -878,7 +938,10 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
             buffer_size
         );
         
-        process_taps_.push_back(std::move(process_tap));
+        {
+            std::scoped_lock lock(process_taps_mutex_);
+            process_taps_.push_back(std::move(process_tap));
+        }
         Logger::info("Created tap {} for PID {}", tap_id, pid);
         log_tap_format(tap_id, pid);
         return true;
@@ -1060,7 +1123,7 @@ bool AudioTapManager::create_aggregate_device(const std::vector<CFStringRef>& ta
 
 void AudioTapManager::destroy_aggregate_device() {
     if (aggregate_device_id_ != kAudioObjectUnknown) {
-        // Destroy all taps first
+        // Destroy all taps first (caller must hold process_taps_mutex_)
         for (auto& tap : process_taps_) {
             if (tap->tap_id != kAudioObjectUnknown) {
                 AudioHardwareDestroyProcessTap(tap->tap_id);

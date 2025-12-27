@@ -12,6 +12,7 @@
 #include <atomic>
 #include <sys/types.h>
 #include <cstdlib>
+#include <mutex>
 
 namespace AudioTrace {
 
@@ -96,6 +97,7 @@ private:
         {}
     };
     
+    mutable std::mutex process_taps_mutex_;
     std::vector<std::unique_ptr<ProcessTap>> process_taps_;
 
     // Worker thread that drains ring buffers
