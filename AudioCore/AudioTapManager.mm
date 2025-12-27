@@ -230,9 +230,10 @@ void AudioTapManager::check_for_new_processes() {
         return;
     }
     
-    // Prevent concurrent rebuilds
+    // Prevent concurrent rebuilds - but remember that we need another rebuild
     if (rebuild_in_progress_.load(std::memory_order_acquire)) {
-        Logger::debug("Rebuild already in progress, ignoring process list change");
+        Logger::debug("Rebuild already in progress, will rebuild again after completion");
+        rebuild_requested_.store(true, std::memory_order_release);
         return;
     }
     
@@ -303,7 +304,7 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     // The system needs time to release resources before creating new taps
     // Increased delay needed after locking changes to ensure full cleanup
     Logger::debug("Waiting for tap cleanup...");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(2000));
     
     // Rediscover and create taps for all current processes
     auto process_objects = discover_audio_processes();
@@ -314,12 +315,19 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     }
     
     std::unordered_set<pid_t> seen;
+    bool tap_creation_failed_stale_objects = false;
     for (AudioObjectID obj_id : process_objects) {
         pid_t pid = get_pid_from_audio_object(obj_id);
         if (pid > 0 && !seen.count(pid)) {
             seen.insert(pid);
             Logger::info("Creating tap for PID {} during rebuild", pid);
-            create_tap_for_process(pid);
+            if (!create_tap_for_process(pid)) {
+                // If tap creation failed, process objects are likely stale
+                // Don't continue spinning through the rest
+                Logger::warn("Tap creation failed for PID {} - aborting rebuild (likely stale process objects)", pid);
+                tap_creation_failed_stale_objects = true;
+                break;
+            }
         }
     }
 
@@ -329,7 +337,17 @@ bool AudioTapManager::rebuild_taps_if_needed() {
         std::scoped_lock lock(process_taps_mutex_);
         if (process_taps_.empty()) {
             Logger::error("Failed to create any process taps during rebuild");
+            
+            // Clear any pending rebuild request and sleep before returning
+            // This lets Core Audio refresh the process object list
+            rebuild_requested_.store(false, std::memory_order_release);
             rebuild_in_progress_.store(false, std::memory_order_release);
+            
+            Logger::debug("Sleeping 1s to let Core Audio refresh process objects");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+            
+            // Re-register listener so we can detect changes and try again
+            register_process_list_listener();
             return false;
         }
         
@@ -403,6 +421,13 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     
     Logger::info("Successfully rebuilt taps - now monitoring {} processes", process_taps_.size());
     rebuild_in_progress_.store(false, std::memory_order_release);
+    
+    // Check if another rebuild was requested while we were rebuilding
+    if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
+        Logger::info("Rebuild was requested during previous rebuild - running another rebuild now");
+        return rebuild_taps_if_needed();
+    }
+    
     return true;
 }
 
@@ -819,13 +844,19 @@ void AudioTapManager::process_input_data(const AudioBufferList* buffer_list,
         
         AudioTapData data;
         data.pid = tap->pid;
-        data.frame_count = frame_count;
         data.channel_count = channel_count;
         data.sample_time = timestamp ? timestamp->mSampleTime : 0;
         
         const size_t copy_size = std::min(static_cast<size_t>(sample_count), tap->temp_buffer.size());
         std::copy_n(samples, copy_size, tap->temp_buffer.begin());
         data.samples = tap->temp_buffer;
+        
+        if (!channel_count) {
+            continue;
+        }
+        // Clamp frame_count to what we actually copied
+        const uint32_t copied_frames = copy_size / channel_count;
+        data.frame_count = copied_frames;
         
         if (!tap->ring_buffer.push(data)) {
             static std::atomic<int> drop_count{0};
@@ -887,13 +918,27 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         const int max_retries = 3;
         for (int attempt = 0; attempt < max_retries; ++attempt) {
             if (attempt > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                // Increase delay between retries if tap creation is failing
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
             }
             
             status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
             
             if (status == noErr && tap_id != kAudioObjectUnknown) {
                 break; // Success!
+            }
+            
+            // If we got noErr but tap_id is unknown, the AudioObjectID is stale
+            // Re-query and abort if the process object is gone
+            if (status == noErr && tap_id == kAudioObjectUnknown) {
+                Logger::debug("Tap ID returned unknown - re-querying process object for PID {}", pid);
+                AudioObjectID fresh_obj_id = find_process_object_for_pid(pid);
+                if (fresh_obj_id == kAudioObjectUnknown) {
+                    Logger::warn("Process object for PID {} is stale/gone - aborting tap creation", pid);
+                    return false;
+                }
+                // Process still exists but tap creation returning unknown - likely Core Audio not ready
+                // Continue retrying
             }
             
             if (attempt < max_retries - 1) {

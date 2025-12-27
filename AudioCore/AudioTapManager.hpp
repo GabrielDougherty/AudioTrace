@@ -130,6 +130,7 @@ private:
     
     bool process_list_listener_registered_ = false;
     std::atomic<bool> rebuild_in_progress_{false};
+    std::atomic<bool> rebuild_requested_{false};
 
     // Core Audio callback (REALTIME SAFE) - for aggregate device
     static OSStatus audio_io_proc(
