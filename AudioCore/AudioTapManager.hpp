@@ -67,7 +67,6 @@ private:
 
     // Debug controls (set via environment variables)
     bool debug_log_buffers_ = false;
-    bool debug_global_only_ = false;
     pid_t debug_single_pid_ = -1;
 
     Config config_;
@@ -109,7 +108,6 @@ private:
     void destroy_aggregate_device();
     bool wait_for_device_ready(AudioObjectID device_id, double timeout_seconds);
     bool create_tap_for_process(pid_t pid);
-    bool create_tap_for_system();
     std::vector<AudioObjectID> discover_audio_processes();
     pid_t get_pid_from_audio_object(AudioObjectID obj_id);
     AudioStreamBasicDescription get_stream_format() const;

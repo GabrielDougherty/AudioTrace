@@ -9,7 +9,6 @@ AudioTrace successfully creates process taps and receives audio callbacks, but a
 - The realtime callback receives zeroes directly from CoreAudio (first samples are 0.0 in `audio_io_proc`), so the silence is upstream of our ring buffers/threads.
 - The correct “audio process objects” must be used; helper PIDs aren’t tappable. Spotify’s actual audio PID appears as PID 707 (object 110) in `kAudioHardwarePropertyProcessObjectList`.
 - Single-PID tap creation succeeds (tap 137, format 48k/2ch), but buffers remain all zeros.
-- Global tap also returns zeros. So the problem is not mis-attribution across buffers.
 - Default output device is 48 kHz, 2 channels (no multi-channel halving bug). Tap formats match.
 - Screen Recording permission is required; lack of it can yield zeroed audio. Environment still returning zeros even with permission.
 - `test_activity` CLI fails to see any audio process objects (likely because it isn’t a bundled app with the entitlement), so it’s not a valid probe.
@@ -40,7 +39,6 @@ AudioTrace successfully creates process taps and receives audio callbacks, but a
 - All audio samples are `0.000000`
 - No audio activity detected from any process
 - RMS levels always `0.000000000`
-- Applies to both per-process and global tap paths in current tests.
 
 ## Build Instructions
 
@@ -129,8 +127,6 @@ Every 1000 callbacks, we log the first buffer's sample values:
 
 1. **Per-process taps**: now created from the CoreAudio process object list (no helpers), targeting default output device/stream when available (`initWithProcesses:andDeviceUID:withStream:0`, else stereo mixdown). `exclusive=NO`, `muteBehavior=Unmuted`, `privateTap=YES`.  
    - Result: Silence (buffers zero).
-2. **System-wide/global tap**: `initStereoGlobalTapButExcludeProcesses:@[]`, `exclusive=NO`, `muteBehavior=Unmuted`, `privateTap=YES`.  
-   - Result: Silence (buffers zero).
 3. **Aggregate device settings**:
    - `kAudioAggregateDeviceIsStackedKey = NO` (separate buffers)
    - `kAudioAggregateDeviceIsPrivateKey = YES`
@@ -140,10 +136,10 @@ Every 1000 callbacks, we log the first buffer's sample values:
 ## Potential Causes
 
 ### 1. Permissions / CoreAudio state
-If Screen Recording is off or coreaudiod hasn’t refreshed after granting, taps can return zeroed audio. (Global tap also zero suggests this.)
+If Screen Recording is off or coreaudiod hasn't refreshed after granting, taps can return zeroed audio.
 
 ### 2. Tap inclusion/exclusion mismatch
-We now set `exclusive=NO` for per-process and global taps. If CoreAudio treats global differently, try `exclusive=YES` on global path to mirror Apple sample.
+We now set `exclusive=NO` for per-process taps. Could try `exclusive=YES` to match Apple sample.
 
 ### 3. Auto-start vs manual start
 We set `kAudioAggregateDeviceTapAutoStartKey=YES`; Apple’s sample sets `NO` and relies on the IOProc start. Could flip to `NO` to match sample (low probability fix).
@@ -170,9 +166,9 @@ If Apple’s sample also delivers zeros, it indicates an environment/permission 
 1. **Permissions/state reset**
    - Confirm AudioTrace is enabled under System Settings → Privacy & Security → Screen Recording; toggle if needed.
    - Restart `coreaudiod` (log out/in or `sudo launchctl kickstart -k system/com.apple.audio.coreaudiod`) and retest.
-2. **Flip auto-start and exclusivity on global tap**
+2. **Flip auto-start and exclusivity**
    - Set `kAudioAggregateDeviceTapAutoStartKey = NO`.
-   - Set `exclusive=YES` on the global tap to mirror the sample.
+   - Set `exclusive=YES` on taps to mirror the sample.
 3. **Run Apple sample**
    - Build/run `context/example-usage-from-github.txt` to confirm the environment delivers non-zero samples. If it also returns zeros, issue is environmental.
 4. **Console logs**
@@ -182,7 +178,7 @@ If Apple’s sample also delivers zeros, it indicates an environment/permission 
 
 Apple's working example (`tapping.m`) uses the exact same approach but reports working audio capture. Key differences to investigate:
 
-1. They use `initStereoGlobalTapButExcludeProcesses` with `exclusive=YES` for global capture.
+1. They use `initStereoGlobalTapButExcludeProcesses` with `exclusive=YES` for capture.
 2. They note the multi-channel volume bug and apply compensation.
 3. They set `kAudioAggregateDeviceTapAutoStartKey = NO` and start via IOProc.
 4. They use a simpler callback that doesn't distribute to ring buffers.

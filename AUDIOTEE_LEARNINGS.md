@@ -113,11 +113,7 @@ CATapDescription* tapDesc = [[CATapDescription alloc] initExcludingProcesses:@[]
 
 ## Testing Steps
 
-1. **Test with system-wide tap first** (AUDIO_TRACE_DEBUG_GLOBAL_ONLY=1)
-   - This already uses the correct architecture
-   - Should provide audio immediately
-
-2. **Then implement single mixed tap** for all processes
+1. **Implement single mixed tap** for all processes
    - Discover all process objects
    - Create ONE tap with all of them
    - mixdown=YES ensures internal mixing

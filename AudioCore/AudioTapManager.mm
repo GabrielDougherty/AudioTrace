@@ -225,7 +225,7 @@ void AudioTapManager::unregister_process_list_listener() {
 }
 
 void AudioTapManager::check_for_new_processes() {
-    if (!is_running_ || debug_global_only_ || debug_single_pid_ > 0) {
+    if (!is_running_ || debug_single_pid_ > 0) {
         return;
     }
     
@@ -398,7 +398,6 @@ bool AudioTapManager::start() {
 
     // Debug controls from environment
     debug_log_buffers_ = std::getenv("AUDIO_TRACE_DEBUG_LOG_BUFFERS") != nullptr;
-    debug_global_only_ = std::getenv("AUDIO_TRACE_DEBUG_GLOBAL_ONLY") != nullptr;
     if (const char* pid_str = std::getenv("AUDIO_TRACE_DEBUG_SINGLE_PID")) {
         debug_single_pid_ = static_cast<pid_t>(std::atoi(pid_str));
     } else {
@@ -407,9 +406,6 @@ bool AudioTapManager::start() {
 
     if (debug_log_buffers_) {
         Logger::debug("Debug logging for buffers is enabled (AUDIO_TRACE_DEBUG_LOG_BUFFERS=1)");
-    }
-    if (debug_global_only_) {
-        Logger::debug("Debug mode: using ONLY global tap (AUDIO_TRACE_DEBUG_GLOBAL_ONLY=1)");
     }
     if (debug_single_pid_ > 0) {
         Logger::debug("Debug mode: single PID tap = {} (AUDIO_TRACE_DEBUG_SINGLE_PID)", debug_single_pid_);
@@ -426,12 +422,6 @@ bool AudioTapManager::start() {
     if (debug_single_pid_ > 0) {
         if (!create_tap_for_process(debug_single_pid_)) {
             Logger::error("Failed to create tap for debug PID {}", debug_single_pid_);
-            return false;
-        }
-    } else if (debug_global_only_) {
-        Logger::info("No audio processes found - creating tap for system audio");
-        if (!create_tap_for_system()) {
-            Logger::error("Failed to create system audio tap");
             return false;
         }
     } else {
@@ -451,11 +441,9 @@ bool AudioTapManager::start() {
         }
     }
     
-    if (process_taps_.empty() && !debug_global_only_ && debug_single_pid_ <= 0) {
-        Logger::warn("Failed to create any process taps, falling back to system audio");
-        if (!create_tap_for_system()) {
-            return false;
-        }
+    if (process_taps_.empty() && debug_single_pid_ <= 0) {
+        Logger::error("Failed to create any process taps");
+        return false;
     }
 
     if (debug_log_buffers_) {
@@ -981,54 +969,6 @@ void AudioTapManager::log_available_audio_processes() {
     for (AudioObjectID obj_id : process_objects) {
         pid_t pid = get_pid_from_audio_object(obj_id);
         Logger::info("    - obj={} pid={}", obj_id, pid);
-    }
-}
-
-bool AudioTapManager::create_tap_for_system() {
-    // For system-wide audio, create a stereo mixdown tap
-    @autoreleasepool {
-        Logger::debug("Creating system-wide tap descriptor...");
-        
-        // Use initStereoGlobalTapButExcludeProcesses with empty array = tap everything
-        CATapDescription* tapDesc = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
-        if (!tapDesc) {
-            Logger::error("Failed to create CATapDescription");
-            return false;
-        }
-        
-        Logger::debug("Tap descriptor created");
-        
-        // Keep audio unmuted for monitoring
-        tapDesc.muteBehavior = CATapUnmuted;
-        tapDesc.privateTap = YES;
-        tapDesc.exclusive = NO;
-        
-        Logger::debug("Tap config: muteBehavior={}, privateTap={}, exclusive={}", 
-              (int)tapDesc.muteBehavior, (int)tapDesc.privateTap, (int)tapDesc.exclusive);
-        
-        Logger::debug("Calling AudioHardwareCreateProcessTap (may trigger permission prompt)...");
-        AudioObjectID tap_id = kAudioObjectUnknown;
-        OSStatus status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
-        
-        Logger::debug("AudioHardwareCreateProcessTap returned: status={}, tap_id={}", (int)status, tap_id);
-        
-        if (status != noErr || tap_id == kAudioObjectUnknown) {
-            Logger::error("Failed to create system-wide tap, status: {} (tap_id={})", (int)status, tap_id);
-            return false;
-        }
-        
-        size_t buffer_size = config_.buffer_frames * 2;
-        auto process_tap = std::make_unique<ProcessTap>(
-            0,  // PID 0 = system-wide
-            tap_id,
-            config_.ringbuffer_capacity,
-            buffer_size
-        );
-        
-        process_taps_.push_back(std::move(process_tap));
-        Logger::info("Created system-wide audio tap {}", tap_id);
-        log_tap_format(tap_id, 0);
-        return true;
     }
 }
 

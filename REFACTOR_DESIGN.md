@@ -221,29 +221,6 @@ for (UInt32 i = 0; i < inInputData->mNumberBuffers; ++i) {
 }
 ```
 
-### Phase 4: Test with Global System Tap
-
-**Create a single tap for ALL system audio (not per-process):**
-
-```objc
-// Simpler test: tap entire system output
-tapDesc = [[CATapDescription alloc] init];
-tapDesc.name = @"audiotrace-global-tap";
-tapDesc.processes = @[];  // Empty = all processes
-tapDesc.isPrivate = YES;
-tapDesc.muteBehavior = CATapUnmuted;
-tapDesc.isMixdown = YES;
-tapDesc.isMono = NO;
-tapDesc.isExclusive = YES;  // Try exclusive first
-tapDesc.deviceUID = nil;
-tapDesc.stream = 0;
-```
-
-**Rationale:**
-- Simpler case to debug
-- AudioTee supports this: empty processes = all audio
-- Eliminates per-process tap complexity
-
 ## Implementation Plan
 
 ### Step 1: Add Debug Mode for Tap Configuration
@@ -261,7 +238,6 @@ Test combinations:
 1. ✅ Current: device_uid="BuiltInSpeakerDevice", convenience initializer
 2. 🆕 Test A: device_uid=nil, convenience initializer  
 3. 🆕 Test B: device_uid=nil, explicit property setting + isMixdown=YES
-4. 🆕 Test C: Global tap (empty processes), device_uid=nil, isMixdown=YES
 
 ### Step 3: Enhanced Logging
 
@@ -304,16 +280,7 @@ AUDIO_TRACE_DEBUG_SINGLE_PID=707 \
 
 Expected: Either audio data OR specific error about tap configuration
 
-### Test 2: Global System Tap
-```bash
-AUDIO_TRACE_DEBUG_GLOBAL_ONLY=1 \
-AUDIO_TRACE_DEBUG_NIL_DEVICE_UID=1 \
-./build/AudioTrace.app/Contents/MacOS/AudioTrace
-```
-
-Expected: System-wide audio from all processes
-
-### Test 3: OCaml Test Harness with Each Configuration
+### Test 2: OCaml Test Harness with Each Configuration
 ```bash
 cd test_harness
 dune exec ./test_silence_issue.exe
@@ -390,9 +357,8 @@ If refactor causes issues:
 1. ✅ Document current findings (this document)
 2. ⏭️ Implement Phase 1: Nil deviceUID + explicit property setting
 3. ⏭️ Test with single process tap
-4. ⏭️ Test with global system tap
-5. ⏭️ Verify with OCaml test harness
-6. ⏭️ Compare buffer data byte-by-byte if still silent
+4. ⏭️ Verify with OCaml test harness
+5. ⏭️ Compare buffer data byte-by-byte if still silent
 
 ## Conclusion
 
