@@ -191,7 +191,7 @@ AudioTapManager::AudioTapManager(Config config)
       })
     , tracker_(ActivityTracker::Config{
         .current_threshold = std::chrono::milliseconds(500),
-        .expiry_time = std::chrono::minutes(2)
+        .expiry_time = std::chrono::minutes(10)
       })
 {}
 
@@ -810,13 +810,12 @@ void AudioTapManager::worker_thread_proc() {
 
         if (!did_work) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        } else {
-            // Periodically cleanup expired entries
-            static int cleanup_counter = 0;
-            if (++cleanup_counter > 100) {
-                tracker_.cleanup_expired();
-                cleanup_counter = 0;
-            }
+        }
+        // Periodically cleanup expired entries
+        static int cleanup_counter = 0;
+        if (++cleanup_counter > 100) {
+            tracker_.cleanup_expired();
+            cleanup_counter = 0;
         }
     }
 }

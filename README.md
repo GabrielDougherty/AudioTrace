@@ -1,6 +1,6 @@
 # AudioTrace
 
-macOS menu bar application that tracks which applications have produced audible sound recently using Core Audio process taps.
+macOS menu bar application that tracks which applications have produced audible sound recently using Core Audio process taps. Shows applications that played audio within the last 10 minutes.
 
 I made this app to answer the question, "where did that sound come from?" when hearing an intermittent beep or something
 
