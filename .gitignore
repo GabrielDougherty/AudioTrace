@@ -32,3 +32,6 @@ _build/
 
 # debug binary
 test_activity
+
+# log files
+*.log
