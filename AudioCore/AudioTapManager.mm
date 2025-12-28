@@ -230,11 +230,10 @@ void AudioTapManager::check_for_new_processes() {
         return;
     }
     
-    // Prevent concurrent rebuilds - but remember that we need another rebuild
-    if (rebuild_in_progress_.load(std::memory_order_acquire)) {
-        AUDIOTRACE_LOG_DEBUG("Rebuild already in progress, will rebuild again after completion");
+    const bool rebuild_in_progress = rebuild_in_progress_.load(std::memory_order_acquire);
+    if (rebuild_in_progress) {
+        AUDIOTRACE_LOG_DEBUG("Rebuild already in progress, queueing new processes for later");
         rebuild_requested_.store(true, std::memory_order_release);
-        return;
     }
     
     auto current_processes = discover_audio_processes();
@@ -274,7 +273,11 @@ void AudioTapManager::check_for_new_processes() {
             }
         }
         
-        rebuild_taps_if_needed();
+        if (!rebuild_in_progress) {
+            rebuild_taps_if_needed();
+        } else {
+            rebuild_requested_.store(true, std::memory_order_release);
+        }
     }
 }
 
@@ -329,6 +332,13 @@ bool AudioTapManager::rebuild_taps_if_needed() {
         if (!create_tap_for_process(pid)) {
             AUDIOTRACE_LOG_WARN("Tap creation failed for PID {}", pid);
             failed_tap_count++;
+            
+            // Requeue failed PID for a later attempt
+            {
+                std::scoped_lock lock(pending_pids_mutex_);
+                pending_new_pids_.insert(pid);
+            }
+            rebuild_requested_.store(true, std::memory_order_release);
         } else {
             successful_tap_count++;
         }
@@ -435,10 +445,15 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     }
     rebuild_in_progress_.store(false, std::memory_order_release);
     
-    // Check if another rebuild was requested while we were rebuilding
-    // Simply return and let it run again - no recursion needed
-    if (rebuild_requested_.load(std::memory_order_acquire)) {
-        AUDIOTRACE_LOG_INFO("Rebuild was requested during previous rebuild - will run again");
+    // If another rebuild was requested or pending PIDs remain, trigger it now
+    bool pending = false;
+    {
+        std::scoped_lock lock(pending_pids_mutex_);
+        pending = !pending_new_pids_.empty();
+    }
+    if (rebuild_requested_.exchange(false, std::memory_order_acq_rel) || pending) {
+        AUDIOTRACE_LOG_INFO("Rebuild was requested during previous rebuild - running again");
+        rebuild_taps_if_needed();
     }
     
     return true;
