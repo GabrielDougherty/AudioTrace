@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_set>
+#include <unordered_map>
 
 namespace AudioTrace {
 
@@ -114,6 +115,7 @@ private:
     bool create_tap_for_process(pid_t pid);
     std::vector<AudioObjectID> discover_audio_processes();
     pid_t get_pid_from_audio_object(AudioObjectID obj_id);
+    pid_t get_parent_pid(pid_t pid);
     AudioStreamBasicDescription get_stream_format() const;
     
     // Process monitoring
@@ -135,6 +137,16 @@ private:
     std::atomic<bool> rebuild_requested_{false};
     std::unordered_set<pid_t> pending_new_pids_;  // Use set to avoid duplicates
     std::mutex pending_pids_mutex_;
+    
+    // Backoff tracking for failing PIDs
+    std::unordered_map<pid_t, std::chrono::steady_clock::time_point> pid_retry_after_;
+    void trigger_pending_rebuild_if_ready();
+    
+    // Diagnostics
+    static std::string osstatus_to_string(OSStatus status);
+    static std::string pid_path(pid_t pid);
+    static std::string audio_object_name(AudioObjectID obj_id);
+    static std::string audio_object_class(AudioObjectID obj_id);
 
     // Core Audio callback (REALTIME SAFE) - for aggregate device
     static OSStatus audio_io_proc(
