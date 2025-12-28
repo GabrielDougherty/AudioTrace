@@ -182,13 +182,6 @@ pid_t AudioTapManager::get_parent_pid(pid_t pid) {
     return -1;
 }
 
-bool AudioTapManager::is_chrome_process(const std::string& path) {
-    if (path.empty()) {
-        return false;
-    }
-    return path.find("Google Chrome") != std::string::npos;
-}
-
 AudioTapManager::AudioTapManager(Config config)
     : config_(config)
     , analyzer_(AudioAnalyzer::Config{
@@ -1001,7 +994,6 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
         std::unordered_set<pid_t> tried;
         pid_t current_pid = pid;
         int fallback_depth = 0;
-        bool tried_multi_chrome = false;
         
         while (true) {
             if (current_pid <= 0 || tried.count(current_pid)) {
@@ -1104,91 +1096,6 @@ bool AudioTapManager::create_tap_for_process(pid_t pid) {
                 AUDIOTRACE_LOG_INFO("Created tap {} for PID {}", tap_id, current_pid);
                 log_tap_format(tap_id, current_pid);
                 return true;
-            }
-            
-            // If Chrome tap failed, try a multi-process tap across all Chrome objects before falling back
-            const bool looks_like_chrome = is_chrome_process(pid_path(current_pid));
-            if (!tried_multi_chrome && looks_like_chrome) {
-                tried_multi_chrome = true;
-                std::vector<AudioObjectID> chrome_objects;
-                std::vector<pid_t> chrome_pids;
-                
-                auto process_objects = discover_audio_processes();
-                std::unordered_set<pid_t> seen_pids;
-                for (AudioObjectID obj_id : process_objects) {
-                    pid_t chrome_pid = get_pid_from_audio_object(obj_id);
-                    if (chrome_pid <= 0 || seen_pids.count(chrome_pid)) continue;
-                    seen_pids.insert(chrome_pid);
-                    const std::string chrome_path = pid_path(chrome_pid);
-                    if (is_chrome_process(chrome_path)) {
-                        chrome_objects.push_back(obj_id);
-                        chrome_pids.push_back(chrome_pid);
-                    }
-                }
-                
-                if (!chrome_objects.empty()) {
-                    NSMutableArray<NSNumber*>* processes = [NSMutableArray arrayWithCapacity:chrome_objects.size()];
-                    for (AudioObjectID obj_id : chrome_objects) {
-                        [processes addObject:@(obj_id)];
-                    }
-                    
-                    AUDIOTRACE_LOG_INFO("Single-process tap failed for PID {} - trying multi-process Chrome tap ({} objects)", current_pid, chrome_objects.size());
-                    CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
-                    
-                    if (tapDesc) {
-                        tapDesc.exclusive = NO;
-                        tapDesc.muteBehavior = CATapUnmuted;
-                        tapDesc.privateTap = YES;
-                        
-                        status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
-                        
-                        if (status == noErr && tap_id != kAudioObjectUnknown) {
-                            // Anchor the tap to the first Chrome PID
-                            if (!chrome_pids.empty()) {
-                                current_pid = chrome_pids.front();
-                            }
-                            // Verify tap format (Step 4 from design doc)
-                            AudioStreamBasicDescription fmt{};
-                            UInt32 size = sizeof(fmt);
-                            AudioObjectPropertyAddress fmt_addr{
-                                kAudioTapPropertyFormat,
-                                kAudioObjectPropertyScopeGlobal,
-                                kAudioObjectPropertyElementMain
-                            };
-                            if (AudioObjectGetPropertyData(tap_id, &fmt_addr, 0, nullptr, &size, &fmt) == noErr) {
-                                AUDIOTRACE_LOG_DEBUG("Tap format: rate={:.0f}, channels={}, bytesPerFrame={}, formatFlags=0x{:x}",
-                                      fmt.mSampleRate, fmt.mChannelsPerFrame, fmt.mBytesPerFrame, fmt.mFormatFlags);
-                                
-                                if (fmt.mSampleRate == 0 || fmt.mChannelsPerFrame == 0) {
-                                    AUDIOTRACE_LOG_ERROR("INVALID tap format detected! rate={:.0f} channels={}",
-                                          fmt.mSampleRate, fmt.mChannelsPerFrame);
-                                }
-                            } else {
-                                AUDIOTRACE_LOG_WARN("Could not get tap format for verification");
-                            }
-
-                            size_t buffer_size = config_.buffer_frames * 2;
-                            auto process_tap = std::make_unique<ProcessTap>(
-                                current_pid,
-                                tap_id,
-                                config_.ringbuffer_capacity,
-                                buffer_size
-                            );
-                            
-                            {
-                                std::scoped_lock lock(process_taps_mutex_);
-                                process_taps_.push_back(std::move(process_tap));
-                            }
-                            AUDIOTRACE_LOG_INFO("Created multi-process Chrome tap {} anchored to PID {}", tap_id, current_pid);
-                            log_tap_format(tap_id, current_pid);
-                            return true;
-                        } else {
-                            AUDIOTRACE_LOG_WARN("Multi-process Chrome tap creation failed (status={} tap_id={})", (int)status, tap_id);
-                        }
-                    } else {
-                        AUDIOTRACE_LOG_WARN("Failed to create multi-process tap descriptor for Chrome");
-                    }
-                }
             }
             
             // Failed to create; try parent fallback once or twice

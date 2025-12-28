@@ -142,7 +142,6 @@ private:
     // Diagnostics
     static std::string osstatus_to_string(OSStatus status);
     static std::string pid_path(pid_t pid);
-    static bool is_chrome_process(const std::string& path);
 
     // Core Audio callback (REALTIME SAFE) - for aggregate device
     static OSStatus audio_io_proc(
