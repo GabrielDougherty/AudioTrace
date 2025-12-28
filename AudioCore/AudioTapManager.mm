@@ -266,10 +266,12 @@ void AudioTapManager::check_for_new_processes() {
             Logger::info("  New PID: {}", pid);
         }
         
-        // Store new PIDs for rebuild
+        // Store new PIDs for rebuild (set automatically deduplicates)
         {
             std::scoped_lock lock(pending_pids_mutex_);
-            pending_new_pids_.insert(pending_new_pids_.end(), new_pids.begin(), new_pids.end());
+            for (pid_t pid : new_pids) {
+                pending_new_pids_.insert(pid);
+            }
         }
         
         rebuild_taps_if_needed();
@@ -306,7 +308,7 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     std::vector<pid_t> new_pids;
     {
         std::scoped_lock lock(pending_pids_mutex_);
-        new_pids = std::move(pending_new_pids_);
+        new_pids.assign(pending_new_pids_.begin(), pending_new_pids_.end());
         pending_new_pids_.clear();
     }
     
@@ -427,30 +429,16 @@ bool AudioTapManager::rebuild_taps_if_needed() {
     // Re-register listener for future changes
     register_process_list_listener();
     
-    Logger::info("Successfully rebuilt taps - now monitoring {} processes", process_taps_.size());
+    {
+        std::scoped_lock lock(process_taps_mutex_);
+        Logger::info("Successfully rebuilt taps - now monitoring {} processes", process_taps_.size());
+    }
     rebuild_in_progress_.store(false, std::memory_order_release);
     
     // Check if another rebuild was requested while we were rebuilding
-    // Use a tail-call loop to avoid unbounded recursion
-    const int max_consecutive_rebuilds = 5;
-    int rebuild_count = 0;
-    while (rebuild_requested_.exchange(false, std::memory_order_acq_rel) && rebuild_count < max_consecutive_rebuilds) {
-        Logger::info("Rebuild was requested during previous rebuild - running another rebuild now (iteration {})", rebuild_count + 1);
-        rebuild_count++;
-        
-        // Actually run the rebuild by calling ourselves
-        // This is tail-recursion so won't blow the stack for reasonable rebuild counts
-        if (!rebuild_taps_if_needed()) {
-            // Rebuild failed, break out
-            break;
-        }
-        
-        // After successful rebuild, check again if another was requested
-        // Loop will continue if so
-    }
-    
-    if (rebuild_count >= max_consecutive_rebuilds) {
-        Logger::warn("Hit max consecutive rebuilds ({}), stopping rebuild loop", max_consecutive_rebuilds);
+    // Simply return and let it run again - no recursion needed
+    if (rebuild_requested_.load(std::memory_order_acquire)) {
+        Logger::info("Rebuild was requested during previous rebuild - will run again");
     }
     
     return true;

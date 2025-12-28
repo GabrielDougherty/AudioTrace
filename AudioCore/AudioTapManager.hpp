@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <cstdlib>
 #include <mutex>
+#include <unordered_set>
 
 namespace AudioTrace {
 
@@ -107,8 +108,8 @@ private:
 
     // Helper methods
     bool create_aggregate_device(const std::vector<CFStringRef>& tap_uids);
-    void destroy_aggregate_device();
-    void destroy_aggregate_device_only(); // Destroy only aggregate, keep taps alive
+    void destroy_aggregate_device();  // Destroys taps + aggregate; caller MUST hold process_taps_mutex_
+    void destroy_aggregate_device_only(); // Destroy only aggregate, keep taps alive; no mutex needed
     bool wait_for_device_ready(AudioObjectID device_id, double timeout_seconds);
     bool create_tap_for_process(pid_t pid);
     std::vector<AudioObjectID> discover_audio_processes();
@@ -132,7 +133,7 @@ private:
     bool process_list_listener_registered_ = false;
     std::atomic<bool> rebuild_in_progress_{false};
     std::atomic<bool> rebuild_requested_{false};
-    std::vector<pid_t> pending_new_pids_;
+    std::unordered_set<pid_t> pending_new_pids_;  // Use set to avoid duplicates
     std::mutex pending_pids_mutex_;
 
     // Core Audio callback (REALTIME SAFE) - for aggregate device
