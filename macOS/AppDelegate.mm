@@ -14,7 +14,7 @@
 @implementation AppDelegate
 
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
-    AudioTrace::Logger::info("AudioTrace starting...");
+    AUDIOTRACE_LOG_INFO("AudioTrace starting...");
 
     // Request accessibility permissions for window title reading
     [self checkAccessibilityPermissions];
@@ -26,7 +26,7 @@
     self.statusItem = [[StatusItem alloc] initWithTapManager:_tapManager.get()];
     [self.statusItem show];
 
-    AudioTrace::Logger::info("AudioTrace menu bar app ready");
+    AUDIOTRACE_LOG_INFO("AudioTrace menu bar app ready");
 }
 
 - (void)checkAccessibilityPermissions {
@@ -34,10 +34,10 @@
     BOOL accessibilityEnabled = AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options);
     
     if (!accessibilityEnabled) {
-        AudioTrace::Logger::warn("Accessibility permissions not granted - window titles will not be available");
-        AudioTrace::Logger::warn("Please grant access in System Settings > Privacy & Security > Accessibility");
+        AUDIOTRACE_LOG_WARN("Accessibility permissions not granted - window titles will not be available");
+        AUDIOTRACE_LOG_WARN("Please grant access in System Settings > Privacy & Security > Accessibility");
     } else {
-        AudioTrace::Logger::info("Accessibility permissions granted");
+        AUDIOTRACE_LOG_INFO("Accessibility permissions granted");
     }
 }
 
@@ -51,15 +51,15 @@
     // Start audio capture - will trigger permission prompt if needed
     bool started = _tapManager->start();
     if (!started) {
-        AudioTrace::Logger::warn("Failed to start audio tap manager");
-        AudioTrace::Logger::warn("Check System Settings > Privacy & Security > Screen Recording");
+        AUDIOTRACE_LOG_WARN("Failed to start audio tap manager");
+        AUDIOTRACE_LOG_WARN("Check System Settings > Privacy & Security > Screen Recording");
     } else {
-        AudioTrace::Logger::info("Audio tap manager started successfully");
+        AUDIOTRACE_LOG_INFO("Audio tap manager started successfully");
     }
 }
 
 - (void)applicationWillTerminate:(NSNotification *)aNotification {
-    AudioTrace::Logger::info("AudioTrace shutting down...");
+    AUDIOTRACE_LOG_INFO("AudioTrace shutting down...");
     
     // Stop audio capture
     if (_tapManager) {

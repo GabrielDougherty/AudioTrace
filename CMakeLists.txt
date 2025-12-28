@@ -18,14 +18,14 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra -Wpedantic")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -O0")
 
-# Fetch spdlog
+# Fetch quill
 include(FetchContent)
 FetchContent_Declare(
-    spdlog
-    GIT_REPOSITORY https://github.com/gabime/spdlog.git
-    GIT_TAG v1.13.0
+    quill
+    GIT_REPOSITORY https://github.com/odygrd/quill.git
+    GIT_TAG v7.3.0
 )
-FetchContent_MakeAvailable(spdlog)
+FetchContent_MakeAvailable(quill)
 
 # AudioCore library (pure C++23)
 add_library(AudioCore STATIC
@@ -51,7 +51,7 @@ find_library(AUDIOTOOLBOX_FRAMEWORK AudioToolbox REQUIRED)
 target_link_libraries(AudioCore PUBLIC
     ${COREAUDIO_FRAMEWORK}
     ${AUDIOTOOLBOX_FRAMEWORK}
-    spdlog::spdlog
+    quill::quill
 )
 
 # Main application (Obj-C++ + C++)

@@ -41,7 +41,7 @@
 
 - (void)updateMenu {
     if (!self.tapManager) {
-        AudioTrace::Logger::warn("updateMenu called but tapManager is NULL");
+        AUDIOTRACE_LOG_WARN("updateMenu called but tapManager is NULL");
         return;
     }
 
@@ -50,7 +50,7 @@
     // Get activity snapshot from tap manager
     auto snapshots = self.tapManager->get_activity_snapshot();
     
-    AudioTrace::Logger::debug("updateMenu: Got {} snapshots", snapshots.size());
+    AUDIOTRACE_LOG_DEBUG("updateMenu: Got {} snapshots", snapshots.size());
 
     if (snapshots.empty()) {
         NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:@"No recent audio activity"
@@ -147,7 +147,7 @@
 - (void)raiseWindow:(NSMenuItem*)sender {
     pid_t pid = sender.tag;
     
-    AudioTrace::Logger::debug("Attempting to raise window for PID {}", pid);
+    AUDIOTRACE_LOG_DEBUG("Attempting to raise window for PID {}", pid);
     
     // Get the activatable application for this PID (handles helper processes)
     NSRunningApplication* app = AudioTrace::ProcessInfo::get_activatable_app(pid);
@@ -159,7 +159,7 @@
     // Activate the application (bring it to front)
     [app activateWithOptions:NSApplicationActivateAllWindows];
     
-    AudioTrace::Logger::debug("Activated application successfully");
+    AUDIOTRACE_LOG_DEBUG("Activated application successfully");
 }
 
 #pragma mark - NSMenuDelegate

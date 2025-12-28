@@ -1,8 +1,10 @@
 #pragma once
 
-#include <spdlog/spdlog.h>
-#include <spdlog/sinks/stdout_color_sinks.h>
-#include <memory>
+#include <quill/Backend.h>
+#include <quill/Frontend.h>
+#include <quill/LogMacros.h>
+#include <quill/Logger.h>
+#include <quill/sinks/ConsoleSink.h>
 #include <string>
 
 namespace AudioTrace {
@@ -16,70 +18,66 @@ namespace AudioTrace {
 class Logger {
 public:
     static void init() {
-        if (!logger_) {
-            logger_ = spdlog::stdout_color_mt("AudioTrace");
+        if (!initialized_) {
+            // Start the backend thread
+            quill::Backend::start();
+            
+            // Create console sink with color support
+            auto console_sink = quill::Frontend::create_or_get_sink<quill::ConsoleSink>("sink_id_1");
+            
+            // Create logger
+            logger_ = quill::Frontend::create_or_get_logger(
+                "AudioTrace",
+                std::move(console_sink)
+            );
             
             // Default to info level, can be changed via environment variable
             const char* log_level = std::getenv("AUDIOTRACE_LOG_LEVEL");
+            quill::LogLevel level = quill::LogLevel::Info;
+            
             if (log_level) {
-                std::string level(log_level);
-                if (level == "debug" || level == "DEBUG") {
-                    logger_->set_level(spdlog::level::debug);
-                } else if (level == "trace" || level == "TRACE") {
-                    logger_->set_level(spdlog::level::trace);
-                } else if (level == "warn" || level == "WARN") {
-                    logger_->set_level(spdlog::level::warn);
-                } else if (level == "error" || level == "ERROR") {
-                    logger_->set_level(spdlog::level::err);
+                std::string level_str(log_level);
+                if (level_str == "debug" || level_str == "DEBUG") {
+                    level = quill::LogLevel::Debug;
+                } else if (level_str == "trace" || level_str == "TRACE") {
+                    level = quill::LogLevel::TraceL3;
+                } else if (level_str == "warn" || level_str == "WARN") {
+                    level = quill::LogLevel::Warning;
+                } else if (level_str == "error" || level_str == "ERROR") {
+                    level = quill::LogLevel::Error;
                 }
             } else {
                 // Default to info level in release, debug in debug builds
                 #ifdef NDEBUG
-                logger_->set_level(spdlog::level::info);
+                level = quill::LogLevel::Info;
                 #else
-                logger_->set_level(spdlog::level::debug);
+                level = quill::LogLevel::Debug;
                 #endif
             }
             
-            // Use a clean pattern: [timestamp] [level] message
-            logger_->set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
+            logger_->set_log_level(level);
+            initialized_ = true;
         }
     }
     
-    static std::shared_ptr<spdlog::logger>& get() {
-        if (!logger_) {
+    static quill::Logger* get() {
+        if (!initialized_) {
             init();
         }
         return logger_;
     }
     
-    template<typename... Args>
-    static void trace(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        get()->trace(fmt, std::forward<Args>(args)...);
-    }
-    
-    template<typename... Args>
-    static void debug(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        get()->debug(fmt, std::forward<Args>(args)...);
-    }
-    
-    template<typename... Args>
-    static void info(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        get()->info(fmt, std::forward<Args>(args)...);
-    }
-    
-    template<typename... Args>
-    static void warn(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        get()->warn(fmt, std::forward<Args>(args)...);
-    }
-    
-    template<typename... Args>
-    static void error(spdlog::format_string_t<Args...> fmt, Args&&... args) {
-        get()->error(fmt, std::forward<Args>(args)...);
-    }
-    
 private:
-    static std::shared_ptr<spdlog::logger> logger_;
+    static quill::Logger* logger_;
+    static bool initialized_;
 };
 
 }  // namespace AudioTrace
+
+// Define logging macros that match the old API
+// These macros provide compile-time format string checking required by Quill
+#define AUDIOTRACE_LOG_TRACE(fmt, ...) LOG_TRACE_L3(::AudioTrace::Logger::get(), fmt, ##__VA_ARGS__)
+#define AUDIOTRACE_LOG_DEBUG(fmt, ...) LOG_DEBUG(::AudioTrace::Logger::get(), fmt, ##__VA_ARGS__)
+#define AUDIOTRACE_LOG_INFO(fmt, ...) LOG_INFO(::AudioTrace::Logger::get(), fmt, ##__VA_ARGS__)
+#define AUDIOTRACE_LOG_WARN(fmt, ...) LOG_WARNING(::AudioTrace::Logger::get(), fmt, ##__VA_ARGS__)
+#define AUDIOTRACE_LOG_ERROR(fmt, ...) LOG_ERROR(::AudioTrace::Logger::get(), fmt, ##__VA_ARGS__)

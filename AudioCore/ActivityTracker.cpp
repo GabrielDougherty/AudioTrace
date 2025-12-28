@@ -88,7 +88,7 @@ void ActivityTracker::cache_window_title(pid_t pid, const std::string& title) {
     auto it = activities_.find(pid);
     if (it != activities_.end() && it->second.cached_window_title.empty() && !title.empty()) {
         it->second.cached_window_title = title;
-        Logger::debug("Cached window title '{}' for PID {}", title, pid);
+        AUDIOTRACE_LOG_DEBUG("Cached window title '{}' for PID {}", title, pid);
     }
 }
 

@@ -1,6 +1,6 @@
 # AudioTrace Logging
 
-AudioTrace uses [spdlog](https://github.com/gabime/spdlog) for structured logging with different log levels.
+AudioTrace uses [Quill](https://github.com/odygrd/quill) for high-performance asynchronous logging with different log levels. Quill provides ultra-low latency logging with minimal overhead in the hot path.
 
 ## Log Levels
 
@@ -16,14 +16,16 @@ AudioTrace uses [spdlog](https://github.com/gabime/spdlog) for structured loggin
 #include "AudioCore/Logger.hpp"
 
 // Simple messages
-AudioTrace::Logger::info("Application started");
-AudioTrace::Logger::warn("Low memory warning");
-AudioTrace::Logger::error("Failed to connect");
+AUDIOTRACE_LOG_INFO("Application started");
+AUDIOTRACE_LOG_WARN("Low memory warning");
+AUDIOTRACE_LOG_ERROR("Failed to connect");
 
-// Formatted messages (uses fmt/spdlog formatting)
-AudioTrace::Logger::debug("Processing PID {} with {} samples", pid, count);
-AudioTrace::Logger::info("Window title: '{}'", title);
+// Formatted messages (uses std::format/Python-style formatting)
+AUDIOTRACE_LOG_DEBUG("Processing PID {} with {} samples", pid, count);
+AUDIOTRACE_LOG_INFO("Window title: '{}'", title);
 ```
+
+**Note:** Logging uses compile-time macros for zero-cost abstraction. The format strings must be compile-time constants.
 
 ## Controlling Log Level
 
@@ -52,14 +54,30 @@ When running as a normal app bundle (via `open`), logs go to Console.app.
 
 ## Migration from NSLog
 
-To migrate existing NSLog calls to spdlog:
+To migrate existing NSLog calls to Quill:
 
 ```objc
 // Old
 NSLog(@"⚠️ Failed to process PID %d", pid);
 
 // New
-AudioTrace::Logger::warn("Failed to process PID {}", pid);
+AUDIOTRACE_LOG_WARN("Failed to process PID {}", pid);
 ```
 
-Note: spdlog uses `{}` for format placeholders (like Python/Rust), not `%d`/`%@` like NSLog.
+Note: Quill uses `{}` for format placeholders (like Python/Rust), not `%d`/`%@` like NSLog.
+
+## Available Logging Macros
+
+- `AUDIOTRACE_LOG_TRACE(fmt, ...)` - Most verbose, detailed diagnostic information
+- `AUDIOTRACE_LOG_DEBUG(fmt, ...)` - Debug-level information
+- `AUDIOTRACE_LOG_INFO(fmt, ...)` - General informational messages
+- `AUDIOTRACE_LOG_WARN(fmt, ...)` - Warning messages
+- `AUDIOTRACE_LOG_ERROR(fmt, ...)` - Error messages
+
+## Performance Benefits
+
+Quill provides:
+- **Asynchronous logging**: Log calls return immediately, actual I/O happens on a background thread
+- **Low latency**: Hot path is optimized for minimal overhead (~10-20ns per log call)
+- **Zero-cost abstraction**: Disabled log levels have zero runtime cost
+- **Type-safe formatting**: Compile-time format string validation
