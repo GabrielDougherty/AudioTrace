@@ -14,7 +14,6 @@
 #include <cstdlib>
 #include <mutex>
 #include <unordered_set>
-#include <unordered_map>
 
 namespace AudioTrace {
 
@@ -104,8 +103,11 @@ private:
 
     // Worker thread that drains ring buffers
     void worker_thread_proc();
+    void poller_thread_proc();
     std::unique_ptr<std::thread> worker_thread_;
+    std::unique_ptr<std::thread> monitor_thread_;
     std::atomic<bool> worker_should_stop_{false};
+    std::atomic<bool> monitor_should_stop_{false};
 
     // Helper methods
     bool create_aggregate_device(const std::vector<CFStringRef>& tap_uids);
@@ -135,18 +137,12 @@ private:
     bool process_list_listener_registered_ = false;
     std::atomic<bool> rebuild_in_progress_{false};
     std::atomic<bool> rebuild_requested_{false};
-    std::unordered_set<pid_t> pending_new_pids_;  // Use set to avoid duplicates
-    std::mutex pending_pids_mutex_;
-    
-    // Backoff tracking for failing PIDs
-    std::unordered_map<pid_t, std::chrono::steady_clock::time_point> pid_retry_after_;
-    void trigger_pending_rebuild_if_ready();
+    std::atomic<bool> full_reset_requested_{false};
     
     // Diagnostics
     static std::string osstatus_to_string(OSStatus status);
     static std::string pid_path(pid_t pid);
-    static std::string audio_object_name(AudioObjectID obj_id);
-    static std::string audio_object_class(AudioObjectID obj_id);
+    static bool is_chrome_process(const std::string& path);
 
     // Core Audio callback (REALTIME SAFE) - for aggregate device
     static OSStatus audio_io_proc(

@@ -171,54 +171,6 @@ std::string AudioTapManager::pid_path(pid_t pid) {
     return "<unknown>";
 }
 
-std::string AudioTapManager::audio_object_name(AudioObjectID obj_id) {
-    CFStringRef name = nullptr;
-    UInt32 size = sizeof(name);
-    AudioObjectPropertyAddress addr{
-        kAudioObjectPropertyName,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    if (AudioObjectGetPropertyData(obj_id, &addr, 0, nullptr, &size, &name) == noErr && name) {
-        std::string s = CFStringGetCStringPtr(name, kCFStringEncodingUTF8);
-        if (s.empty()) {
-            char buf[256];
-            if (CFStringGetCString(name, buf, sizeof(buf), kCFStringEncodingUTF8)) {
-                s = buf;
-            }
-        }
-        CFRelease(name);
-        return s.empty() ? "<unnamed>" : s;
-    }
-    return "<unknown>";
-}
-
-std::string AudioTapManager::audio_object_class(AudioObjectID obj_id) {
-    AudioClassID class_id = 0;
-    UInt32 size = sizeof(class_id);
-    AudioObjectPropertyAddress addr{
-        kAudioObjectPropertyClass,
-        kAudioObjectPropertyScopeGlobal,
-        kAudioObjectPropertyElementMain
-    };
-    if (AudioObjectGetPropertyData(obj_id, &addr, 0, nullptr, &size, &class_id) == noErr) {
-        char fourcc[5] = {0};
-        *reinterpret_cast<AudioClassID*>(fourcc) = class_id;
-        bool printable = true;
-        for (int i = 0; i < 4; ++i) {
-            if (fourcc[i] < 32 || fourcc[i] > 126) {
-                printable = false;
-                break;
-            }
-        }
-        if (printable) {
-            return std::string(fourcc, 4);
-        }
-        return std::to_string(class_id);
-    }
-    return "<unknown>";
-}
-
 pid_t AudioTapManager::get_parent_pid(pid_t pid) {
     struct kinfo_proc info{};
     size_t length = sizeof(info);
@@ -228,6 +180,13 @@ pid_t AudioTapManager::get_parent_pid(pid_t pid) {
         return info.kp_eproc.e_ppid;
     }
     return -1;
+}
+
+bool AudioTapManager::is_chrome_process(const std::string& path) {
+    if (path.empty()) {
+        return false;
+    }
+    return path.find("Google Chrome") != std::string::npos;
 }
 
 AudioTapManager::AudioTapManager(Config config)
@@ -317,10 +276,9 @@ void AudioTapManager::check_for_new_processes() {
         return;
     }
     
-    const bool rebuild_in_progress = rebuild_in_progress_.load(std::memory_order_acquire);
-    if (rebuild_in_progress) {
-        AUDIOTRACE_LOG_DEBUG("Rebuild already in progress, queueing new processes for later");
-        rebuild_requested_.store(true, std::memory_order_release);
+    // If a rebuild is already running, skip; the poller will recheck shortly.
+    if (rebuild_in_progress_.load(std::memory_order_acquire)) {
+        return;
     }
     
     auto current_processes = discover_audio_processes();
@@ -351,134 +309,96 @@ void AudioTapManager::check_for_new_processes() {
         for (pid_t pid : new_pids) {
             AUDIOTRACE_LOG_INFO("  New PID: {}", pid);
         }
-        
-        // Store new PIDs for rebuild (set automatically deduplicates)
-        {
-            std::scoped_lock lock(pending_pids_mutex_);
-            for (pid_t pid : new_pids) {
-                pending_new_pids_.insert(pid);
-            }
-        }
-        
-        if (!rebuild_in_progress) {
-            rebuild_taps_if_needed();
-        } else {
-            rebuild_requested_.store(true, std::memory_order_release);
-        }
+        // Always record that a rebuild is needed; caller will coalesce requests.
+        rebuild_requested_.store(true, std::memory_order_release);
+        full_reset_requested_.store(true, std::memory_order_release);
+        rebuild_taps_if_needed();
     }
 }
 
 bool AudioTapManager::rebuild_taps_if_needed() {
-    // Set flag to prevent concurrent rebuilds
-    bool expected = false;
-    if (!rebuild_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
-        AUDIOTRACE_LOG_WARN("Rebuild already in progress, skipping");
-        return false;
-    }
+    bool any_rebuild = false;
+    bool last_result = false;
     
-    AUDIOTRACE_LOG_INFO("Rebuilding audio taps to include new processes");
-    
-    // Unregister listener to prevent recursive triggers during rebuild
-    unregister_process_list_listener();
-    
-    // Stop the IOProc, but keep existing taps alive
-    if (io_proc_id_ != nullptr) {
-        AudioDeviceStop(aggregate_device_id_, io_proc_id_);
-        AudioDeviceDestroyIOProcID(aggregate_device_id_, io_proc_id_);
-        io_proc_id_ = nullptr;
-        
-        AUDIOTRACE_LOG_DEBUG("Waiting for device to stop...");
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    
-    // Collect existing tap UIDs
-    std::vector<CFStringRef> tap_uids;
-    {
-        std::scoped_lock lock(process_taps_mutex_);
-        for (const auto& tap : process_taps_) {
-            CFStringRef tap_uid = nullptr;
-            UInt32 data_size = sizeof(tap_uid);
-            AudioObjectPropertyAddress prop_addr{
-                kAudioTapPropertyUID,
-                kAudioObjectPropertyScopeGlobal,
-                kAudioObjectPropertyElementMain
-            };
-            
-            OSStatus status = AudioObjectGetPropertyData(
-                tap->tap_id,
-                &prop_addr,
-                0,
-                nullptr,
-                &data_size,
-                &tap_uid
-            );
-            
-            if (status == noErr && tap_uid) {
-                tap_uids.push_back(tap_uid);
-            }
+    while (true) {
+        // Set flag to prevent concurrent rebuilds
+        bool expected = false;
+        if (!rebuild_in_progress_.compare_exchange_strong(expected, true, std::memory_order_acquire)) {
+            // Another rebuild is in flight; coalesce this request.
+            rebuild_requested_.store(true, std::memory_order_release);
+            return any_rebuild ? last_result : false;
         }
-    }
-    
-    // Rediscover all audio processes and create taps for any missing PIDs
-    auto process_objects = discover_audio_processes();
-    if (process_objects.empty()) {
-        AUDIOTRACE_LOG_WARN("No audio processes found during rebuild");
-        rebuild_in_progress_.store(false, std::memory_order_release);
-        register_process_list_listener();
-        return false;
-    }
+        
+        // We own the rebuild now; clear the request flag for this iteration.
+        rebuild_requested_.store(false, std::memory_order_release);
+        any_rebuild = true;
+        
+        AUDIOTRACE_LOG_INFO("Rebuilding audio taps to include new processes");
+        
+        // Unregister listener to prevent recursive triggers during rebuild
+        unregister_process_list_listener();
+        
+        // Stop the IOProc, but keep existing taps alive
+        AudioDeviceID old_device_id = aggregate_device_id_;
+        if (io_proc_id_ != nullptr) {
+            AudioDeviceStop(old_device_id, io_proc_id_);
+            AudioDeviceDestroyIOProcID(old_device_id, io_proc_id_);
+            io_proc_id_ = nullptr;
+            
+            AUDIOTRACE_LOG_DEBUG("Waiting for device to stop...");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        
+        // Rediscover all audio processes
+        auto process_objects = discover_audio_processes();
+        if (process_objects.empty()) {
+            AUDIOTRACE_LOG_WARN("No audio processes found during rebuild");
+            register_process_list_listener();
+            last_result = false;
+            rebuild_in_progress_.store(false, std::memory_order_release);
+            if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
+                continue;
+            }
+            return last_result;
+        }
 
-    AUDIOTRACE_LOG_INFO("Discovered {} audio process object(s) for rebuild", process_objects.size());
-    for (AudioObjectID obj_id : process_objects) {
-        pid_t pid = get_pid_from_audio_object(obj_id);
-        AUDIOTRACE_LOG_DEBUG("  AudioObj={} PID={} class={} name={} path={}",
-              obj_id,
-              pid,
-              audio_object_class(obj_id),
-              audio_object_name(obj_id),
-              pid_path(pid));
-    }
-    
-    std::unordered_set<pid_t> seen;
-    int failed_tap_count = 0;
-    int successful_tap_count = 0;
-    
-    for (AudioObjectID obj_id : process_objects) {
-        pid_t pid = get_pid_from_audio_object(obj_id);
-        if (pid > 0 && !seen.count(pid)) {
+        // Create taps for missing PIDs (keep existing taps)
+        std::unordered_set<pid_t> seen;
+        int failed_tap_count = 0;
+        for (AudioObjectID obj_id : process_objects) {
+            pid_t pid = get_pid_from_audio_object(obj_id);
+            if (pid <= 0 || seen.count(pid)) continue;
             seen.insert(pid);
             
-            bool already_tapped = false;
-            {
+            auto already_tapped = [&](pid_t test_pid) {
                 std::scoped_lock lock(process_taps_mutex_);
                 for (const auto& tap : process_taps_) {
-                    if (tap->pid == pid) {
-                        already_tapped = true;
-                        break;
+                    if (tap->pid == test_pid) {
+                        return true;
                     }
                 }
-            }
+                return false;
+            };
             
-            if (already_tapped) {
+            if (already_tapped(pid)) {
                 continue;
             }
             
-            AUDIOTRACE_LOG_INFO("Creating tap for PID {} during rebuild (new)", pid);
+            AUDIOTRACE_LOG_INFO("Creating tap for PID {} during rebuild (full reset)", pid);
             if (!create_tap_for_process(pid)) {
-                AUDIOTRACE_LOG_WARN("Tap creation failed for PID {}", pid);
                 failed_tap_count++;
-                
-                // If it's a helper, enqueue parent PID to try
-                pid_t parent = get_parent_pid(pid);
-                if (parent > 0 && parent != pid) {
-                    AUDIOTRACE_LOG_DEBUG("Enqueuing parent PID {} for failed PID {} (path={})", parent, pid, pid_path(pid));
-                    std::scoped_lock lock(pending_pids_mutex_);
-                    pending_new_pids_.insert(parent);
-                }
-            } else {
-                successful_tap_count++;
-                
-                // Get UID for the new tap
+            }
+        }
+        
+        if (failed_tap_count > 0) {
+            AUDIOTRACE_LOG_INFO("Tap creation failed for {} process(es) during rebuild", failed_tap_count);
+        }
+        
+        // Collect tap UIDs from taps (existing + new)
+        std::vector<CFStringRef> tap_uids;
+        {
+            std::scoped_lock lock(process_taps_mutex_);
+            for (const auto& tap : process_taps_) {
                 CFStringRef tap_uid = nullptr;
                 UInt32 data_size = sizeof(tap_uid);
                 AudioObjectPropertyAddress prop_addr{
@@ -487,91 +407,107 @@ bool AudioTapManager::rebuild_taps_if_needed() {
                     kAudioObjectPropertyElementMain
                 };
                 
-                std::scoped_lock lock(process_taps_mutex_);
-                CFStringRef uid_local = nullptr;
-                if (!process_taps_.empty()) {
-                    const auto& new_tap = process_taps_.back();
-                    OSStatus status = AudioObjectGetPropertyData(
-                        new_tap->tap_id,
-                        &prop_addr,
-                        0,
-                        nullptr,
-                        &data_size,
-                        &uid_local
-                    );
-                    if (status == noErr && uid_local) {
-                        tap_uids.push_back(uid_local);
-                    }
+                OSStatus status = AudioObjectGetPropertyData(
+                    tap->tap_id,
+                    &prop_addr,
+                    0,
+                    nullptr,
+                    &data_size,
+                    &tap_uid
+                );
+                
+                if (status == noErr && tap_uid) {
+                    tap_uids.push_back(tap_uid);
                 }
             }
         }
-    }
-    
-    if (failed_tap_count > 0) {
-        AUDIOTRACE_LOG_INFO("Failed to create taps for {} process(es) during rebuild", failed_tap_count);
-    }
-    
-    if (tap_uids.empty()) {
-        rebuild_in_progress_.store(false, std::memory_order_release);
-        register_process_list_listener();
-        AUDIOTRACE_LOG_WARN("No tap UIDs collected after rebuild");
-        return false;
-    }
         
-    // Create new aggregate device
-    if (!create_aggregate_device(tap_uids)) {
+        if (tap_uids.empty()) {
+            register_process_list_listener();
+            AUDIOTRACE_LOG_WARN("No tap UIDs collected after rebuild");
+            last_result = false;
+            rebuild_in_progress_.store(false, std::memory_order_release);
+            if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
+                continue;
+            }
+            return last_result;
+        }
+            
+        // Create new aggregate device
+        if (!create_aggregate_device(tap_uids)) {
+            for (auto uid : tap_uids) {
+                if (uid) CFRelease(uid);
+            }
+            last_result = false;
+            register_process_list_listener();
+            rebuild_in_progress_.store(false, std::memory_order_release);
+            if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
+                continue;
+            }
+            return last_result;
+        }
+        
         for (auto uid : tap_uids) {
             if (uid) CFRelease(uid);
         }
-        rebuild_in_progress_.store(false, std::memory_order_release);
+        
+        // Wait for device to be ready
+        if (!wait_for_device_ready(aggregate_device_id_, 2.0)) {
+            AUDIOTRACE_LOG_WARN("Aggregate device did not become ready after rebuild");
+        }
+        
+        // Register IOProc callback
+        OSStatus status = AudioDeviceCreateIOProcID(
+            aggregate_device_id_,
+            audio_io_proc,
+            this,
+            &io_proc_id_
+        );
+        
+        if (status != noErr) {
+            AUDIOTRACE_LOG_ERROR("Failed to create IOProcID after rebuild: {}", status);
+            last_result = false;
+            rebuild_in_progress_.store(false, std::memory_order_release);
+            if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
+                continue;
+            }
+            return last_result;
+        }
+        
+        // Start the device
+        status = AudioDeviceStart(aggregate_device_id_, io_proc_id_);
+        if (status != noErr) {
+            AUDIOTRACE_LOG_ERROR("Failed to start aggregate device after rebuild: {}", status);
+            last_result = false;
+            rebuild_in_progress_.store(false, std::memory_order_release);
+            if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
+                continue;
+            }
+            return last_result;
+        }
+        
+        // Destroy the previous aggregate device now that the new one is running
+        if (old_device_id != kAudioObjectUnknown && old_device_id != aggregate_device_id_) {
+            AudioHardwareDestroyAggregateDevice(old_device_id);
+        }
+        
+        // Re-register listener for future changes
         register_process_list_listener();
-        return false;
-    }
-    
-    for (auto uid : tap_uids) {
-        if (uid) CFRelease(uid);
-    }
-    
-    // Wait for device to be ready
-    if (!wait_for_device_ready(aggregate_device_id_, 2.0)) {
-        AUDIOTRACE_LOG_WARN("Aggregate device did not become ready after rebuild");
-    }
-    
-    // Register IOProc callback
-    OSStatus status = AudioDeviceCreateIOProcID(
-        aggregate_device_id_,
-        audio_io_proc,
-        this,
-        &io_proc_id_
-    );
-    
-    if (status != noErr) {
-        AUDIOTRACE_LOG_ERROR("Failed to create IOProcID after rebuild: {}", status);
+        
+        {
+            std::scoped_lock lock(process_taps_mutex_);
+            AUDIOTRACE_LOG_INFO("Successfully rebuilt taps - now monitoring {} processes", process_taps_.size());
+        }
+        last_result = true;
         rebuild_in_progress_.store(false, std::memory_order_release);
-        return false;
+        
+        // If another rebuild was requested during this run, loop again immediately
+        if (rebuild_requested_.exchange(false, std::memory_order_acq_rel)) {
+            continue;
+        }
+        
+        return last_result;
     }
-    
-    // Start the device
-    status = AudioDeviceStart(aggregate_device_id_, io_proc_id_);
-    if (status != noErr) {
-        AUDIOTRACE_LOG_ERROR("Failed to start aggregate device after rebuild: {}", status);
-        rebuild_in_progress_.store(false, std::memory_order_release);
-        return false;
-    }
-    
-    // Re-register listener for future changes
-    register_process_list_listener();
-    
-    {
-        std::scoped_lock lock(process_taps_mutex_);
-        AUDIOTRACE_LOG_INFO("Successfully rebuilt taps - now monitoring {} processes", process_taps_.size());
-    }
-    rebuild_in_progress_.store(false, std::memory_order_release);
-    
-    // Clear any pending flags; a full rebuild was just done
-    rebuild_requested_.store(false, std::memory_order_release);
-    
-    return true;
 }
 
 
@@ -700,6 +636,12 @@ bool AudioTapManager::start() {
     worker_thread_ = std::make_unique<std::thread>(
         &AudioTapManager::worker_thread_proc, this
     );
+    
+    // Start monitor thread to poll for late process objects
+    monitor_should_stop_.store(false, std::memory_order_release);
+    monitor_thread_ = std::make_unique<std::thread>(
+        &AudioTapManager::poller_thread_proc, this
+    );
 
     // Step 5: Register IOProc callback for aggregate device
     OSStatus status = AudioDeviceCreateIOProcID(
@@ -742,6 +684,8 @@ void AudioTapManager::stop() {
         return;
     }
 
+    monitor_should_stop_.store(true, std::memory_order_release);
+
     // Unregister process list listener
     unregister_process_list_listener();
 
@@ -759,6 +703,11 @@ void AudioTapManager::stop() {
         worker_thread_->join();
     }
     worker_thread_.reset();
+    
+    if (monitor_thread_ && monitor_thread_->joinable()) {
+        monitor_thread_->join();
+    }
+    monitor_thread_.reset();
 
     // Destroy aggregate device and taps
     {
@@ -876,13 +825,17 @@ void AudioTapManager::worker_thread_proc() {
                 cleanup_counter = 0;
             }
         }
+    }
+}
 
-        // Periodically check if any pending PIDs are ready to retry
-        static int rebuild_check_counter = 0;
-        if (++rebuild_check_counter > 100) {  // roughly every second
-            trigger_pending_rebuild_if_ready();
-            rebuild_check_counter = 0;
+void AudioTapManager::poller_thread_proc() {
+    while (!monitor_should_stop_.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (monitor_should_stop_.load(std::memory_order_acquire)) {
+            break;
         }
+        // Poll for new processes in case CoreAudio didn't fire a listener event
+        check_for_new_processes();
     }
 }
 
@@ -1035,119 +988,228 @@ AudioStreamBasicDescription AudioTapManager::get_stream_format() const {
 
 bool AudioTapManager::create_tap_for_process(pid_t pid) {
     @autoreleasepool {
-        // Create the tap - THIS WILL TRIGGER THE PERMISSION PROMPT!
-        AudioObjectID tap_id = kAudioObjectUnknown;
-        OSStatus status = noErr;
+        auto is_already_tapped = [&](pid_t test_pid) {
+            std::scoped_lock lock(process_taps_mutex_);
+            for (const auto& tap : process_taps_) {
+                if (tap->pid == test_pid) {
+                    return true;
+                }
+            }
+            return false;
+        };
         
-        // Retry, Core Audio may not be ready immediately after cleanup
-        const int max_retries = 3;
-        for (int attempt = 0; attempt < max_retries; ++attempt) {
-            if (attempt > 0) {
-                // Increase delay between retries if tap creation is failing
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            }
-            
-            AudioObjectID process_obj_id = find_process_object_for_pid(pid);
-            if (process_obj_id == kAudioObjectUnknown) {
-                AUDIOTRACE_LOG_WARN("Process object for PID {} is stale/gone - aborting tap creation (path={})", pid, pid_path(pid));
+        std::unordered_set<pid_t> tried;
+        pid_t current_pid = pid;
+        int fallback_depth = 0;
+        bool tried_multi_chrome = false;
+        
+        while (true) {
+            if (current_pid <= 0 || tried.count(current_pid)) {
                 return false;
             }
+            tried.insert(current_pid);
             
-            const std::string obj_class = audio_object_class(process_obj_id);
-            const std::string obj_name = audio_object_name(process_obj_id);
-            const std::string process_path = pid_path(pid);
+            if (is_already_tapped(current_pid)) {
+                AUDIOTRACE_LOG_INFO("PID {} already tapped, skipping creation", current_pid);
+                return true;
+            }
             
-            // Create array of process AudioObjectIDs
-            NSNumber* processID = @(process_obj_id);
-            NSArray<NSNumber*>* processes = @[processID];
+            // Create the tap - THIS WILL TRIGGER THE PERMISSION PROMPT!
+            AudioObjectID tap_id = kAudioObjectUnknown;
+            OSStatus status = noErr;
+            
+            // Single attempt per PID to avoid long stalls during rebuild
+            const int max_retries = 1;
+            for (int attempt = 0; attempt < max_retries; ++attempt) {
+                AudioObjectID process_obj_id = find_process_object_for_pid(current_pid);
+                if (process_obj_id == kAudioObjectUnknown) {
+                    AUDIOTRACE_LOG_WARN("Process object for PID {} is stale/gone - aborting tap creation (path={})", current_pid, pid_path(current_pid));
+                    break;
+                }
+                const std::string process_path = pid_path(current_pid);
+                
+                // Create array of process AudioObjectIDs
+                NSNumber* processID = @(process_obj_id);
+                NSArray<NSNumber*>* processes = @[processID];
 
-            // OPTION 1 TEST: Always use initStereoMixdownOfProcesses
-            // This is the key - use the mixdown initializer for single-process taps
-            AUDIOTRACE_LOG_DEBUG("Creating stereo mixdown tap for single process (attempt {} / {}) (PID {}, obj {}, class={}, name={}, path={})",
-                  attempt + 1,
-                  max_retries,
-                  pid,
-                  process_obj_id,
-                  obj_class,
-                  obj_name,
-                  process_path);
-            CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
-            
-            if (!tapDesc) {
-                AUDIOTRACE_LOG_ERROR("Failed to create tap descriptor for PID {} (path={})", pid, process_path);
-                return false;
+                // Use stereo mixdown for single-process taps
+                AUDIOTRACE_LOG_DEBUG("Creating stereo mixdown tap (attempt {} / {}) PID {} obj {} path={}",
+                      attempt + 1,
+                      max_retries,
+                      current_pid,
+                      process_obj_id,
+                      process_path);
+                CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
+                
+                if (!tapDesc) {
+                    AUDIOTRACE_LOG_ERROR("Failed to create tap descriptor for PID {} (path={})", current_pid, process_path);
+                    break;
+                }
+                
+                // These properties should already be set by the initializer, but set them explicitly to be safe
+                tapDesc.exclusive = NO;
+                tapDesc.muteBehavior = CATapUnmuted;
+                tapDesc.privateTap = YES;
+                
+                status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
+                
+                if (status == noErr && tap_id != kAudioObjectUnknown) {
+                    break; // Success!
+                }
+                
+                AUDIOTRACE_LOG_DEBUG("Tap creation returned status={} ({}) tap_id={} (PID {} obj {} path={})", 
+                                     (int)status,
+                                     osstatus_to_string(status),
+                                     tap_id,
+                                     current_pid,
+                                     process_obj_id,
+                                     process_path);
             }
-            
-            // These properties should already be set by the initializer, but set them explicitly to be safe
-            tapDesc.exclusive = NO;
-            tapDesc.muteBehavior = CATapUnmuted;
-            tapDesc.privateTap = YES;
-            
-            status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
             
             if (status == noErr && tap_id != kAudioObjectUnknown) {
-                break; // Success!
+                // Verify tap format (Step 4 from design doc)
+                AudioStreamBasicDescription fmt{};
+                UInt32 size = sizeof(fmt);
+                AudioObjectPropertyAddress fmt_addr{
+                    kAudioTapPropertyFormat,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain
+                };
+                if (AudioObjectGetPropertyData(tap_id, &fmt_addr, 0, nullptr, &size, &fmt) == noErr) {
+                    AUDIOTRACE_LOG_DEBUG("Tap format: rate={:.0f}, channels={}, bytesPerFrame={}, formatFlags=0x{:x}",
+                          fmt.mSampleRate, fmt.mChannelsPerFrame, fmt.mBytesPerFrame, fmt.mFormatFlags);
+                    
+                    // CRITICAL: Verify this is NOT zero or invalid
+                    if (fmt.mSampleRate == 0 || fmt.mChannelsPerFrame == 0) {
+                        AUDIOTRACE_LOG_ERROR("INVALID tap format detected! rate={:.0f} channels={}",
+                              fmt.mSampleRate, fmt.mChannelsPerFrame);
+                    }
+                } else {
+                    AUDIOTRACE_LOG_WARN("Could not get tap format for verification");
+                }
+
+                // Create ProcessTap structure
+                size_t buffer_size = config_.buffer_frames * 2;
+                auto process_tap = std::make_unique<ProcessTap>(
+                    current_pid,
+                    tap_id,
+                    config_.ringbuffer_capacity,
+                    buffer_size
+                );
+                
+                {
+                    std::scoped_lock lock(process_taps_mutex_);
+                    process_taps_.push_back(std::move(process_tap));
+                }
+                AUDIOTRACE_LOG_INFO("Created tap {} for PID {}", tap_id, current_pid);
+                log_tap_format(tap_id, current_pid);
+                return true;
             }
             
-            AUDIOTRACE_LOG_WARN("Tap creation returned status={} ({}) tap_id={} (PID {} obj {} class={} name={} path={})", 
-                                 (int)status,
-                                 osstatus_to_string(status),
-                                 tap_id,
-                                 pid,
-                                 process_obj_id,
-                                 obj_class,
-                                 obj_name,
-                                 process_path);
-        }
-        
-        if (status != noErr || tap_id == kAudioObjectUnknown) {
+            // If Chrome tap failed, try a multi-process tap across all Chrome objects before falling back
+            const bool looks_like_chrome = is_chrome_process(pid_path(current_pid));
+            if (!tried_multi_chrome && looks_like_chrome) {
+                tried_multi_chrome = true;
+                std::vector<AudioObjectID> chrome_objects;
+                std::vector<pid_t> chrome_pids;
+                
+                auto process_objects = discover_audio_processes();
+                std::unordered_set<pid_t> seen_pids;
+                for (AudioObjectID obj_id : process_objects) {
+                    pid_t chrome_pid = get_pid_from_audio_object(obj_id);
+                    if (chrome_pid <= 0 || seen_pids.count(chrome_pid)) continue;
+                    seen_pids.insert(chrome_pid);
+                    const std::string chrome_path = pid_path(chrome_pid);
+                    if (is_chrome_process(chrome_path)) {
+                        chrome_objects.push_back(obj_id);
+                        chrome_pids.push_back(chrome_pid);
+                    }
+                }
+                
+                if (!chrome_objects.empty()) {
+                    NSMutableArray<NSNumber*>* processes = [NSMutableArray arrayWithCapacity:chrome_objects.size()];
+                    for (AudioObjectID obj_id : chrome_objects) {
+                        [processes addObject:@(obj_id)];
+                    }
+                    
+                    AUDIOTRACE_LOG_INFO("Single-process tap failed for PID {} - trying multi-process Chrome tap ({} objects)", current_pid, chrome_objects.size());
+                    CATapDescription* tapDesc = [[CATapDescription alloc] initStereoMixdownOfProcesses:processes];
+                    
+                    if (tapDesc) {
+                        tapDesc.exclusive = NO;
+                        tapDesc.muteBehavior = CATapUnmuted;
+                        tapDesc.privateTap = YES;
+                        
+                        status = AudioHardwareCreateProcessTap(tapDesc, &tap_id);
+                        
+                        if (status == noErr && tap_id != kAudioObjectUnknown) {
+                            // Anchor the tap to the first Chrome PID
+                            if (!chrome_pids.empty()) {
+                                current_pid = chrome_pids.front();
+                            }
+                            // Verify tap format (Step 4 from design doc)
+                            AudioStreamBasicDescription fmt{};
+                            UInt32 size = sizeof(fmt);
+                            AudioObjectPropertyAddress fmt_addr{
+                                kAudioTapPropertyFormat,
+                                kAudioObjectPropertyScopeGlobal,
+                                kAudioObjectPropertyElementMain
+                            };
+                            if (AudioObjectGetPropertyData(tap_id, &fmt_addr, 0, nullptr, &size, &fmt) == noErr) {
+                                AUDIOTRACE_LOG_DEBUG("Tap format: rate={:.0f}, channels={}, bytesPerFrame={}, formatFlags=0x{:x}",
+                                      fmt.mSampleRate, fmt.mChannelsPerFrame, fmt.mBytesPerFrame, fmt.mFormatFlags);
+                                
+                                if (fmt.mSampleRate == 0 || fmt.mChannelsPerFrame == 0) {
+                                    AUDIOTRACE_LOG_ERROR("INVALID tap format detected! rate={:.0f} channels={}",
+                                          fmt.mSampleRate, fmt.mChannelsPerFrame);
+                                }
+                            } else {
+                                AUDIOTRACE_LOG_WARN("Could not get tap format for verification");
+                            }
+
+                            size_t buffer_size = config_.buffer_frames * 2;
+                            auto process_tap = std::make_unique<ProcessTap>(
+                                current_pid,
+                                tap_id,
+                                config_.ringbuffer_capacity,
+                                buffer_size
+                            );
+                            
+                            {
+                                std::scoped_lock lock(process_taps_mutex_);
+                                process_taps_.push_back(std::move(process_tap));
+                            }
+                            AUDIOTRACE_LOG_INFO("Created multi-process Chrome tap {} anchored to PID {}", tap_id, current_pid);
+                            log_tap_format(tap_id, current_pid);
+                            return true;
+                        } else {
+                            AUDIOTRACE_LOG_WARN("Multi-process Chrome tap creation failed (status={} tap_id={})", (int)status, tap_id);
+                        }
+                    } else {
+                        AUDIOTRACE_LOG_WARN("Failed to create multi-process tap descriptor for Chrome");
+                    }
+                }
+            }
+            
+            // Failed to create; try parent fallback once or twice
+            pid_t parent = get_parent_pid(current_pid);
+            if (parent > 1 && parent != current_pid && fallback_depth < 2 && !tried.count(parent)) {
+                AUDIOTRACE_LOG_INFO("Tap creation failed for PID {} - trying parent PID {}", current_pid, parent);
+                current_pid = parent;
+                ++fallback_depth;
+                continue;
+            }
+            
+            // Final failure
             AUDIOTRACE_LOG_ERROR("AudioHardwareCreateProcessTap failed for PID {} after {} attempts (status={} / {}) path={} tap_id={}", 
-                                 pid,
+                                 current_pid,
                                  max_retries,
                                  (int)status,
                                  osstatus_to_string(status),
-                                 pid_path(pid),
+                                 pid_path(current_pid),
                                  tap_id);
             return false;
         }
-        
-        // Verify tap format (Step 4 from design doc)
-        AudioStreamBasicDescription fmt{};
-        UInt32 size = sizeof(fmt);
-        AudioObjectPropertyAddress fmt_addr{
-            kAudioTapPropertyFormat,
-            kAudioObjectPropertyScopeGlobal,
-            kAudioObjectPropertyElementMain
-        };
-        if (AudioObjectGetPropertyData(tap_id, &fmt_addr, 0, nullptr, &size, &fmt) == noErr) {
-            AUDIOTRACE_LOG_DEBUG("Tap format: rate={:.0f}, channels={}, bytesPerFrame={}, formatFlags=0x{:x}",
-                  fmt.mSampleRate, fmt.mChannelsPerFrame, fmt.mBytesPerFrame, fmt.mFormatFlags);
-            
-            // CRITICAL: Verify this is NOT zero or invalid
-            if (fmt.mSampleRate == 0 || fmt.mChannelsPerFrame == 0) {
-                AUDIOTRACE_LOG_ERROR("INVALID tap format detected! rate={:.0f} channels={}",
-                      fmt.mSampleRate, fmt.mChannelsPerFrame);
-            }
-        } else {
-            AUDIOTRACE_LOG_WARN("Could not get tap format for verification");
-        }
-
-        // Create ProcessTap structure
-        size_t buffer_size = config_.buffer_frames * 2;
-        auto process_tap = std::make_unique<ProcessTap>(
-            pid,
-            tap_id,
-            config_.ringbuffer_capacity,
-            buffer_size
-        );
-        
-        {
-            std::scoped_lock lock(process_taps_mutex_);
-            process_taps_.push_back(std::move(process_tap));
-        }
-        AUDIOTRACE_LOG_INFO("Created tap {} for PID {}", tap_id, pid);
-        log_tap_format(tap_id, pid);
-        return true;
     }
 }
 
@@ -1345,34 +1407,6 @@ void AudioTapManager::destroy_aggregate_device_only() {
     if (aggregate_device_id_ != kAudioObjectUnknown) {
         AudioHardwareDestroyAggregateDevice(aggregate_device_id_);
         aggregate_device_id_ = kAudioObjectUnknown;
-    }
-}
-
-void AudioTapManager::trigger_pending_rebuild_if_ready() {
-    if (!is_running_) {
-        return;
-    }
-    
-    bool has_ready = false;
-    {
-        std::scoped_lock lock(pending_pids_mutex_);
-        const auto now = std::chrono::steady_clock::now();
-        for (pid_t pid : pending_new_pids_) {
-            auto it = pid_retry_after_.find(pid);
-            if (it != pid_retry_after_.end() && it->second > now) {
-                continue;
-            }
-            has_ready = true;
-            break;
-        }
-    }
-    
-    if (has_ready) {
-        if (!rebuild_in_progress_.load(std::memory_order_acquire)) {
-            rebuild_taps_if_needed();
-        } else {
-            rebuild_requested_.store(true, std::memory_order_release);
-        }
     }
 }
 
